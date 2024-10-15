@@ -1,5 +1,15 @@
+set(MQTT_SOURCES
+    mqtt_vpn.c
+)
+
+set(MQTT_HEADERS
+    mqtt_vpn.h
+)
+
 file(GLOB SOURCES_MAYAQUA "*.c" "Crypto/*.c")
 file(GLOB HEADERS_MAYAQUA "*.h" "Crypto/*.h")
+list(APPEND SOURCES_MAYAQUA ${MQTT_SOURCES})
+list(APPEND HEADERS_MAYAQUA ${MQTT_HEADERS})
 
 if(WIN32)
   add_library(mayaqua STATIC ${SOURCES_MAYAQUA} ${HEADERS_MAYAQUA})
@@ -38,9 +48,11 @@ if (HAVE_SSL_CTX_SET_NUM_TICKETS)
   add_compile_definitions(HAVE_SSL_CTX_SET_NUM_TICKETS)
 endif()
 
-
-
 find_package(ZLIB REQUIRED)
+
+# Add these lines
+find_package(MQTTClient REQUIRED)
+include_directories(${MQTTCLIENT_INCLUDE_DIRS})
 
 # Required because we include <openssl/opensslv.h> in Encrypt.h.
 target_include_directories(mayaqua PUBLIC ${OPENSSL_INCLUDE_DIR})
@@ -51,6 +63,7 @@ target_link_libraries(mayaqua
     OpenSSL::SSL
     OpenSSL::Crypto
     ZLIB::ZLIB
+    ${MQTTCLIENT_LIBRARIES}  # Add this line
 )
 
 if(WIN32)
