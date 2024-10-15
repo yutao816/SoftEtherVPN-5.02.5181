@@ -6,6 +6,7 @@
 // Network communication module
 
 #include "Network.h"
+#include "mqtt_vpn.h"
 #include "Cfg.h"
 #include "DNS.h"
 #include "FileIO.h"
@@ -24,6 +25,8 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+
+#include "MQTTClient.h"
 
 #ifdef OS_UNIX
 #include <fcntl.h>
@@ -122,10 +125,49 @@ static LIST *g_private_ip_list = NULL;
 static LIST *g_dyn_value_list = NULL;
 
 
-
 //#define	RUDP_DETAIL_LOG
+void InitializeTransport(SOCK *sock, bool use_mqtt)
+{
+    sock->UseMQTT = use_mqtt;
+    if (use_mqtt)
+    {
+        InitMQTT(&sock->mqtt_sock);
+    }
+}
 
+void CleanupTransport(SOCK *sock)
+{
+    if (sock->UseMQTT)
+    {
+        CleanupMQTT(&sock->mqtt_sock);
+    }
+}
 
+UINT SendTo(SOCK *sock, IP *dest_addr, UINT dest_port, void *data, UINT size)
+{
+    if (sock->UseMQTT)
+    {
+        return SendToMQTT(&sock->mqtt_sock, data, size);
+    }
+    else
+    {
+        // 使用现有的 UDP 发送函数
+        return SendToInternal(sock, dest_addr, dest_port, data, size);
+    }
+}
+
+UINT RecvFrom(SOCK *sock, IP *src_addr, UINT *src_port, void *data, UINT size)
+{
+    if (sock->UseMQTT)
+    {
+        return RecvFromMQTT(&sock->mqtt_sock, data, size);
+    }
+    else
+    {
+        // 使用现有的 UDP 接收函数
+        return RecvFromInternal(sock, src_addr, src_port, data, size);
+    }
+}
 
 
 // Get a value from a dynamic value list (Returns a default value if the value is not found)
@@ -15517,7 +15559,23 @@ void CleanupSock(SOCK *s)
 }
 
 // Creating a new socket
-SOCK *NewSock()
+// SOCK *NewSock()
+// {
+// 	SOCK *s = ZeroMallocFast(sizeof(SOCK));
+
+// 	s->ref = NewRef();
+// 	s->lock = NewLock();
+// 	s->SendBuf = NewBuf();
+// 	s->socket = INVALID_SOCKET;
+// 	s->ssl_lock = NewLock();
+// 	s->disconnect_lock = NewLock();
+
+// 	Inc(num_tcp_connections);
+
+// 	return s;
+// }
+// 添加一个枚举类型来表示协议
+SOCK *NewSock(UINT protocol_type)
 {
 	SOCK *s = ZeroMallocFast(sizeof(SOCK));
 
@@ -15527,6 +15585,22 @@ SOCK *NewSock()
 	s->socket = INVALID_SOCKET;
 	s->ssl_lock = NewLock();
 	s->disconnect_lock = NewLock();
+
+	switch (protocol_type)
+	{
+		case SOCK_UDP:
+			s->Type = SOCK_UDP;
+			s->UdpMaxMsgSize = UDP_MAX_MSG_SIZE_DEFAULT;
+			break;
+		case SOCK_MQTT:
+			s->Type = SOCK_TCP;
+			s->UseMQTT = true;
+			InitMqttSock(&s->mqtt_sock);
+			break;
+		default:
+			s->Type = SOCK_TCP;
+			break;
+	}
 
 	Inc(num_tcp_connections);
 
