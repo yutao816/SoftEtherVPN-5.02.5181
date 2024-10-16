@@ -10,8 +10,6 @@
 
 #include "Encrypt.h"
 #include "Mayaqua.h"
-#include "mqtt_vpn.h"
-#include "MQTTClient.h"
 
 #include <openssl/ssl.h> // This is needed only for the SSL/TLS version defines
 
@@ -143,8 +141,7 @@ struct SOCK_EVENT
 // Type of socket
 #define	SOCK_TCP				1
 #define	SOCK_UDP				2
-#define	SOCK_MQTT				3
-#define	SOCK_INPROC				4
+#define	SOCK_INPROC				3
 #define	SOCK_RUDP_LISTEN		5
 #define	SOCK_REVERSE_LISTEN		6
 
@@ -228,8 +225,6 @@ struct SOCK
 	UCHAR Ssl_Init_Async_SendAlert[2];	// Initial state of SSL send_alert
 	SSL_ACCEPT_SETTINGS SslAcceptSettings;	// SSL Accept Settings
 	bool RawIP_HeaderIncludeFlag;
-	bool UseMQTT;
-    MQTT_SOCK mqtt_sock;
 
 #ifdef	ENABLE_SSL_LOGGING
 	// SSL Logging (for debug)
@@ -257,10 +252,6 @@ struct SOCK
 	void *hEvent;				// Event for asynchronous mode
 #endif	// OS_WIN32
 };
-// Add new function declarations
-void InitializeTransport(SOCK *sock, bool use_mqtt);
-void CleanupTransport(SOCK *sock);
-
 
 // Underlying protocol description string of socket
 #define	SOCK_UNDERLAY_NATIVE_V6		"Standard TCP/IP (IPv6)"
