@@ -108,8 +108,7 @@ struct CLIENT_OPTION
 	char CustomHttpHeader[HTTP_CUSTOM_HEADER_MAX_SIZE];		// Custom HTTP proxy header
 	char HintStr[MAX_HOST_NAME_LEN + 1];					// Hint string for NAT-T
 	IP   BindLocalIP;										// Source IP address for outgoing connection
-	UINT BindLocalPort;	
-	bool UseMqtt;									// Source port number for outgoing connection
+	UINT BindLocalPort;										// Source port number for outgoing connection
 };
 
 // Client authentication data
@@ -248,8 +247,6 @@ struct CONNECTION
 	bool IsJsonRpc;					// Is JSON-RPC
 	bool JsonRpcAuthed;				// JSON-RPC Authed
 	LISTENER *Listener;				// Listener ref
-	MQTT_SOCK *MqttSock;			// MQTT socket
-	bool UseMqtt;					// Use MQTT
 };
 
 
