@@ -1067,7 +1067,10 @@ UINT CedarGetFifoBudgetConsuming(CEDAR *c);
 UINT CedarGetQueueBudgetBalance(CEDAR *c);
 UINT CedarGetFifoBudgetBalance(CEDAR *c);
 bool CedarIsThereAnyEapEnabledRadiusConfig(CEDAR *c);
-
+// 在文件末尾添加以下函数原型
+bool IsMqttEnabled(SESSION *s);
+void SetMqttOption(CLIENT_OPTION *opt, bool use_mqtt);
+SOCK *CreateMQTTSock(char *broker_url, char *username, char *password, char *client_id);
 
 
 #endif	// CEDAR_H
