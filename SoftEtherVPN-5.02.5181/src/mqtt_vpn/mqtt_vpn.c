@@ -21,6 +21,7 @@
  * explicit. See the file LICENSE for further details.                    *
  *************************************************************************/
 
+#define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,19 +30,14 @@
 #include <windows.h>
 #include <iphlpapi.h>
 #include <stdint.h>
+#include <time.h>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <iphlpapi.h>
-#else
-#include <net/if.h>
-#endif
-
-   
 #include "MQTTClient.h"
+
 #ifdef USE_SODIUM
 #include "sodium.h"
 #endif
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
@@ -64,9 +60,7 @@
 
 #define HOST "fec2::22"
 
-#ifdef _WIN32
 #define IFNAMSIZ 256
-#endif
 
 #ifndef IFF_TUN
 #define IFF_TUN 0x0001
@@ -78,18 +72,18 @@
 
 struct in6_ifreq
 {
-  struct in6_addr ifr6_addr;
-  ULONG ifr6_prefixlen;
-  unsigned int ifr6_ifindex;
+    struct in6_addr ifr6_addr;
+    ULONG ifr6_prefixlen;
+    unsigned int ifr6_ifindex;
 };
 
 MQTTClient client;
 MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
 char *receive_topic, *broadcast_topic;
 #define N_ADDR_MAX 10
-uint8_t n_addr=0;
+uint8_t n_addr = 0;
 char *addr_topic[N_ADDR_MAX];
-u_char key[32];  // Assuming crypto_secretbox_KEYBYTES is 32
+unsigned char key[32];  // Assuming crypto_secretbox_KEYBYTES is 32
 unsigned char key_set = 0;
 
 char *if_addr = NULL;
@@ -101,17 +95,17 @@ char *progname;
 HANDLE tap_fd;
 int net2tap = 0;
 
-int tun_alloc(char *dev, int flags) {
-    // 这里需要实现Windows下的TUN/TAP设备创建逻辑
-    // 可能需要使用 TAP-Windows 驱动程序
-    // 返回设备句柄
-    return 0; // 临时返回值，需要实际实现
+// Windows-specific TUN/TAP device allocation
+HANDLE tun_alloc(char *dev, int flags) {
+    // This function needs to be implemented for Windows
+    // It should create and open a TUN/TAP device
+    // For now, we'll just return INVALID_HANDLE_VALUE
+    return INVALID_HANDLE_VALUE;
 }
 
 int cread(HANDLE fd, unsigned char *buf, int n) {
     DWORD bytesRead;
     if (!ReadFile(fd, buf, n, &bytesRead, NULL)) {
-        // 处理错误
         return -1;
     }
     return bytesRead;
@@ -120,7 +114,6 @@ int cread(HANDLE fd, unsigned char *buf, int n) {
 int cwrite(HANDLE fd, unsigned char *buf, int n) {
     DWORD bytesWritten;
     if (!WriteFile(fd, buf, n, &bytesWritten, NULL)) {
-        // 处理错误
         return -1;
     }
     return bytesWritten;
@@ -128,160 +121,220 @@ int cwrite(HANDLE fd, unsigned char *buf, int n) {
 
 int read_n(HANDLE fd, unsigned char *buf, int n)
 {
-  int nread, left = n;
+    int nread, left = n;
 
-  while (left > 0)
-  {
-    if ((nread = cread(fd, buf, left)) == 0)
+    while (left > 0)
     {
-      return 0;
+        if ((nread = cread(fd, buf, left)) == 0)
+        {
+            return 0;
+        }
+        else
+        {
+            left -= nread;
+            buf += nread;
+        }
     }
-    else
-    {
-      left -= nread;
-      buf += nread;
-    }
-  }
-  return n;
+    return n;
 }
 
 void do_debug(char *msg, ...)
 {
-  va_list argp;
-  if (debug)
-  {
-    va_start(argp, msg);
-    vfprintf(stderr, msg, argp);
-    va_end(argp);
-  }
+    va_list argp;
+    if (debug)
+    {
+        va_start(argp, msg);
+        vfprintf(stderr, msg, argp);
+        va_end(argp);
+    }
 }
 
 void my_err(char *msg, ...)
 {
-  va_list argp;
-  va_start(argp, msg);
-  vfprintf(stderr, msg, argp);
-  va_end(argp);
+    va_list argp;
+    va_start(argp, msg);
+    vfprintf(stderr, msg, argp);
+    va_end(argp);
 }
 
 void usage(void)
 {
-  fprintf(stderr, "Usage:\n");
-  fprintf(stderr, "%s -i <if_name> -a <ip> -b <broker> [-m <netmask>] [-n <clientid>] [-d]\n", progname);
-  fprintf(stderr, "%s -h\n", progname);
-  fprintf(stderr, "\n");
-  fprintf(stderr, "-i <if_name>: Name of interface to use (mandatory)\n");
-  fprintf(stderr, "-a <ip>: IP address of interface to use (mandatory)\n");
-  fprintf(stderr, "-b <broker>: Address of MQTT broker (like: tcp://broker.io:1883) (mandatory)\n");
-  fprintf(stderr, "-u <username>: user of the MQTT broker\n");
-  fprintf(stderr, "-p <password>: password of the MQTT broker user\n");
-  fprintf(stderr, "-k <password>: preshared key for all clients of this VPN\n");
-  fprintf(stderr, "-m <netmask>: Netmask of interface to use (default 255.255.255.0)\n");
-  fprintf(stderr, "-6 <ip6>: IPv6 address of interface to use\n");
-  fprintf(stderr, "-x <prefix>: prefix length of the IPv6 address (default 64)\n");
-  fprintf(stderr, "-n <clientid>: ID of MQTT client (%s<random>)\n", CLIENTID_PRE);
-  fprintf(stderr, "-d: outputs debug information while running\n");
-  fprintf(stderr, "-t <ip>: IP address of a target to NAT\n");
-  fprintf(stderr, "-h: prints this help text\n");
-  exit(1);
+    fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "%s -i <if_name> -a <ip> -b <broker> [-m <netmask>] [-n <clientid>] [-d]\n", progname);
+    fprintf(stderr, "%s -h\n", progname);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "-i <if_name>: Name of interface to use (mandatory)\n");
+    fprintf(stderr, "-a <ip>: IP address of interface to use (mandatory)\n");
+    fprintf(stderr, "-b <broker>: Address of MQTT broker (like: tcp://broker.io:1883) (mandatory)\n");
+    fprintf(stderr, "-u <username>: user of the MQTT broker\n");
+    fprintf(stderr, "-p <password>: password of the MQTT broker user\n");
+    fprintf(stderr, "-k <password>: preshared key for all clients of this VPN\n");
+    fprintf(stderr, "-m <netmask>: Netmask of interface to use (default 255.255.255.0)\n");
+    fprintf(stderr, "-6 <ip6>: IPv6 address of interface to use\n");
+    fprintf(stderr, "-x <prefix>: prefix length of the IPv6 address (default 64)\n");
+    fprintf(stderr, "-n <clientid>: ID of MQTT client (%s<random>)\n", CLIENTID_PRE);
+    fprintf(stderr, "-d: outputs debug information while running\n");
+    fprintf(stderr, "-t <ip>: IP address of a target to NAT\n");
+    fprintf(stderr, "-h: prints this help text\n");
+    exit(1);
 }
 
 void delivered(void *context, MQTTClient_deliveryToken dt)
 {
-  fprintf(stderr, "Message with token value %d delivery confirmed\n", dt);
+    fprintf(stderr, "Message with token value %d delivery confirmed\n", dt);
 }
 
 int msgarrvd(void *context, char *topicName, int topicLen, MQTTClient_message *message)
 {
-  int nwrite;
-  unsigned int packet_len;
-  unsigned char *packet_start;
-  int packet_ok = 1;
-  do_debug("Message arrived %d bytes on topic: %s\n", message->payloadlen, topicName);
-  uint8_t i=0;
-  while (i<n_addr && !(strncmp(topicName, addr_topic[i], topicLen) == 0))
-  {
-    ++i;
-  }
-  if (i<n_addr)
-  {
-    net2tap++;
-    packet_start = message->payload;
-    packet_len = message->payloadlen;
-    unsigned char *m = malloc(packet_len);
-    if (key_set)
+    int nwrite;
+    unsigned int packet_len;
+    unsigned char *packet_start;
+    int packet_ok = 1;
+    do_debug("Message arrived %d bytes on topic: %s\n", message->payloadlen, topicName);
+    uint8_t i=0;
+    while (i<n_addr && !(strncmp(topicName, addr_topic[i], topicLen) == 0))
     {
-      if ((packet_len <= 24 + 32) ||
-         (crypto_secretbox_open(m, packet_start + 24, packet_len - 24, packet_start, key) == -1))
-      {
-        do_debug("NET2TAP %lu: Decrypt Error\r\n", net2tap);
-        packet_ok = 0;
-      } else {
-        packet_start = m + 32;
-        packet_len = packet_len - 24 - 32;
-      }
+        ++i;
     }
-    if (packet_ok)
+    if (i<n_addr)
     {
-      if (packet_len <= 1500)
-      {
-        nwrite = cwrite(tap_fd, (unsigned char *)packet_start, packet_len);
-        do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
-      }
-      else
-      {
-        do_debug("NET2TAP %lu: %d bytes too long to write the tap interface\n", net2tap, message->payloadlen);
-      }
+        net2tap++;
+        packet_start = message->payload;
+        packet_len = message->payloadlen;
+        unsigned char *m = malloc(packet_len);
+        if (key_set)
+        {
+            if ((packet_len <= 24 + 32) ||
+                (crypto_secretbox_open(m, packet_start + 24, packet_len - 24, packet_start, key) == -1))
+            {
+                do_debug("NET2TAP %lu: Decrypt Error\r\n", net2tap);
+                packet_ok = 0;
+            } else {
+                packet_start = m + 32;
+                packet_len = packet_len - 24 - 32;
+            }
+        }
+        if (packet_ok)
+        {
+            if (packet_len <= 1500)
+            {
+                nwrite = cwrite(tap_fd, (unsigned char *)packet_start, packet_len);
+                do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
+            }
+            else
+            {
+                do_debug("NET2TAP %lu: %d bytes too long to write the tap interface\n", net2tap, message->payloadlen);
+            }
+        }
+        free(m);
     }
-    free(m);
-  }
-  MQTTClient_freeMessage(&message);
-  MQTTClient_free(topicName);
+    MQTTClient_freeMessage(&message);
+    MQTTClient_free(topicName);
 
-  return 1;
+    return 1;
 }
 
 void mqtt_if_add_reading_topic(const char* addr)
 {
-  if (n_addr<N_ADDR_MAX)
-  {
-    addr_topic[n_addr] = malloc(sizeof(TOPIC_PRE) + strlen(addr) + 2);
-    sprintf(addr_topic[n_addr], "%s/%s", TOPIC_PRE, addr);
-    printf("Added topic: %s\n", addr_topic[n_addr]);
-    n_addr++;
-  }
+    if (n_addr<N_ADDR_MAX)
+    {
+        addr_topic[n_addr] = malloc(sizeof(TOPIC_PRE) + strlen(addr) + 2);
+        sprintf(addr_topic[n_addr], "%s/%s", TOPIC_PRE, addr);
+        printf("Added topic: %s\n", addr_topic[n_addr]);
+        n_addr++;
+    }
 }
 
 void mqtt_if_subscribe()
 {
-  for (uint8_t i=0; i<n_addr; ++i)
-  {
-    do_debug("Subscribing to topic %s\n", addr_topic[i]);
-    MQTTClient_subscribe(client, addr_topic[i], QOS);
-  }
+    for (uint8_t i=0; i<n_addr; ++i)
+    {
+        do_debug("Subscribing to topic %s\n", addr_topic[i]);
+        MQTTClient_subscribe(client, addr_topic[i], QOS);
+    }
 }
 
 void mqttconnect()
 {
-  int rc;
-  if ((rc = MQTTClient_connect(client, &conn_opts)) != MQTTCLIENT_SUCCESS)
-  {
-    fprintf(stderr, "Failed to connect, return code %d\n", rc);
-    exit(-1);
-  }
-  do_debug("Successfully connected client %s to the MQTT broker %s\n", cl_id, broker);
-  mqtt_if_add_reading_topic(if_addr);
-  mqtt_if_add_reading_topic("255.255.255.255");
-  mqtt_if_subscribe();
-  fprintf(stderr, "MQTT VPN client %s on broker %s for ip address %s started\n", cl_id, broker, if_addr);
+    int rc;
+    if ((rc = MQTTClient_connect(client, &conn_opts)) != MQTTCLIENT_SUCCESS)
+    {
+        fprintf(stderr, "Failed to connect, return code %d\n", rc);
+        exit(-1);
+    }
+    do_debug("Successfully connected client %s to the MQTT broker %s\n", cl_id, broker);
+    mqtt_if_add_reading_topic(if_addr);
+    mqtt_if_add_reading_topic("255.255.255.255");
+    mqtt_if_subscribe();
+    fprintf(stderr, "MQTT VPN client %s on broker %s for ip address %s started\n", cl_id, broker, if_addr);
 }
 
 void connlost(void *context, char *cause)
 {
-  fprintf(stderr, "\nConnection lost\n");
-  fprintf(stderr, "     cause: %s\n", cause);
-  fprintf(stderr, "\nReconnecting...\n");
-  mqttconnect();
+    fprintf(stderr, "\nConnection lost\n");
+    fprintf(stderr, "     cause: %s\n", cause);
+    fprintf(stderr, "\nReconnecting...\n");
+    mqttconnect();
+}
+
+// Windows-specific getopt implementation
+int opterr = 1,
+    optind = 1,
+    optopt,
+    optreset;
+char *optarg;
+
+int getopt(int nargc, char * const nargv[], const char *ostr)
+{
+    static char *place = "";
+    const char *oli;
+
+    if (optreset || !*place) {
+        optreset = 0;
+        if (optind >= nargc || *(place = nargv[optind]) != '-') {
+            place = "";
+            return -1;
+        }
+        if (place[1] && *++place == '-') {
+            ++optind;
+            place = "";
+            return -1;
+        }
+    }
+
+    if ((optopt = *place++) == ':' ||
+        !(oli = strchr(ostr, optopt))) {
+        if (optopt == '-')
+            return -1;
+        if (!*place)
+            ++optind;
+        if (opterr && *ostr != ':')
+            fprintf(stderr, "%s: illegal option -- %c\n", nargv[0], optopt);
+        return '?';
+    }
+
+    if (*++oli != ':') {
+        optarg = NULL;
+        if (!*place)
+            ++optind;
+    }
+    else {
+        if (*place)
+            optarg = place;
+        else if (nargc <= ++optind) {
+            place = "";
+            if (*ostr == ':')
+                return ':';
+            if (opterr)
+                fprintf(stderr, "%s: option requires an argument -- %c\n", nargv[0], optopt);
+            return '?';
+        }
+        else
+            optarg = nargv[optind];
+        place = "";
+        ++optind;
+    }
+    return optopt;
 }
 
 int main(int argc, char *argv[])
@@ -292,7 +345,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int option;
+    int opt;
     int flags = IFF_TUN;
     char if_name[IFNAMSIZ] = "";
     char if_mask[20] = "255.255.255.0";
@@ -312,12 +365,12 @@ int main(int argc, char *argv[])
     MQTTClient_deliveryToken token;
 
     progname = argv[0];
-    srand(time(NULL));
+    srand((unsigned int)time(NULL));
 
     /* Check command line options */
-    while ((option = getopt(argc, argv, "i:a:m:k:6:x:b:u:p:n:t:hd")) > 0)
+    while ((opt = getopt(argc, argv, "i:a:m:k:6:x:b:u:p:n:t:hd")) > 0)
     {
-        switch (option)
+        switch (opt)
         {
             case 'd':
                 debug = 1;
@@ -371,7 +424,7 @@ int main(int argc, char *argv[])
                 mqtt_if_add_reading_topic(optarg);
                 break;
             default:
-                my_err("Unknown option %c\n", option);
+                my_err("Unknown option %c\n", opt);
                 usage();
         }
     }
