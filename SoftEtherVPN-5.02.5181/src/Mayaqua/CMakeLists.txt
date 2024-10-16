@@ -1,15 +1,5 @@
-set(MQTT_SOURCES
-    mqtt_vpn.c
-)
-
-set(MQTT_HEADERS
-    mqtt_vpn.h
-)
-
 file(GLOB SOURCES_MAYAQUA "*.c" "Crypto/*.c")
 file(GLOB HEADERS_MAYAQUA "*.h" "Crypto/*.h")
-list(APPEND SOURCES_MAYAQUA ${MQTT_SOURCES})
-list(APPEND HEADERS_MAYAQUA ${MQTT_HEADERS})
 
 if(WIN32)
   add_library(mayaqua STATIC ${SOURCES_MAYAQUA} ${HEADERS_MAYAQUA})
@@ -48,27 +38,9 @@ if (HAVE_SSL_CTX_SET_NUM_TICKETS)
   add_compile_definitions(HAVE_SSL_CTX_SET_NUM_TICKETS)
 endif()
 
+
+
 find_package(ZLIB REQUIRED)
-
-# Add these lines
-find_library(MQTTCLIENT_LIBRARY
-    NAMES paho-mqtt3c
-    PATHS ${CMAKE_PREFIX_PATH}/lib
-)
-find_path(MQTTCLIENT_INCLUDE_DIR
-    NAMES MQTTClient.h
-    PATHS ${CMAKE_PREFIX_PATH}/include
-)
-
-if(MQTTCLIENT_LIBRARY AND MQTTCLIENT_INCLUDE_DIR)
-    message(STATUS "Found MQTT Client library: ${MQTTCLIENT_LIBRARY}")
-    message(STATUS "Found MQTT Client include dir: ${MQTTCLIENT_INCLUDE_DIR}")
-    target_include_directories(mayaqua PRIVATE ${MQTTCLIENT_INCLUDE_DIR})
-    target_link_libraries(mayaqua PRIVATE ${MQTTCLIENT_LIBRARY})
-else()
-    message(WARNING "MQTT Client library not found. MQTT functionality will be disabled.")
-    target_compile_definitions(mayaqua PRIVATE NO_MQTT)
-endif()
 
 # Required because we include <openssl/opensslv.h> in Encrypt.h.
 target_include_directories(mayaqua PUBLIC ${OPENSSL_INCLUDE_DIR})
