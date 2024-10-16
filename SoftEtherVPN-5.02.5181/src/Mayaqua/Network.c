@@ -6,7 +6,7 @@
 // Network communication module
 
 #include "Network.h"
-
+#include "mqtt_vpn.h"
 #include "Cfg.h"
 #include "DNS.h"
 #include "FileIO.h"
@@ -25,6 +25,8 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+
+#include "MQTTClient.h"
 
 #ifdef OS_UNIX
 #include <fcntl.h>
@@ -123,10 +125,49 @@ static LIST *g_private_ip_list = NULL;
 static LIST *g_dyn_value_list = NULL;
 
 
-
 //#define	RUDP_DETAIL_LOG
+void InitializeTransport(SOCK *sock, bool use_mqtt)
+{
+    sock->UseMQTT = use_mqtt;
+    if (use_mqtt)
+    {
+        InitMQTT(&sock->mqtt_sock);
+    }
+}
 
+void CleanupTransport(SOCK *sock)
+{
+    if (sock->UseMQTT)
+    {
+        CleanupMQTT(&sock->mqtt_sock);
+    }
+}
 
+UINT SendTo(SOCK *sock, IP *dest_addr, UINT dest_port, void *data, UINT size)
+{
+    if (sock->UseMQTT)
+    {
+        return SendToMQTT(&sock->mqtt_sock, data, size);
+    }
+    else
+    {
+        // 使用现有的 UDP 发送函数
+        return SendToInternal(sock, dest_addr, dest_port, data, size);
+    }
+}
+
+UINT RecvFrom(SOCK *sock, IP *src_addr, UINT *src_port, void *data, UINT size)
+{
+    if (sock->UseMQTT)
+    {
+        return RecvFromMQTT(&sock->mqtt_sock, data, size);
+    }
+    else
+    {
+        // 使用现有的 UDP 接收函数
+        return RecvFromInternal(sock, src_addr, src_port, data, size);
+    }
+}
 
 
 // Get a value from a dynamic value list (Returns a default value if the value is not found)
@@ -3389,44 +3430,47 @@ UINT64 RUDPGetCurrentSendingMaxSeqNo(RUDP_SESSION *se)
 	return s->SeqNo;
 }
 
-// R-UDP segment transmission
-void RUDPSendSegmentNow(RUDP_STACK *r, RUDP_SESSION *se, UINT64 seq_no, void *data, UINT size)
+// R-UDP���ݶδ���
+void RUDPSendSegmentNow(RUDP_STACK* r, RUDP_SESSION* se, UINT64 seq_no, void* data, UINT size)
 {
-	UCHAR dst[RUDP_MAX_PACKET_SIZE];
-	UCHAR *p;
-	UCHAR *iv;
-	LIST *o = NULL;
-	UINT i;
-	UCHAR padlen;
-	UINT current_size;
-	UCHAR sign[SHA1_SIZE];
-	UCHAR key[SHA1_SIZE];
-	UCHAR keygen[SHA1_SIZE * 2];
-	CRYPT *c;
-	UINT next_iv_pos;
-	UINT num_ack;
-	UINT icmp_type = 0;
-	// Validate arguments
+	UCHAR dst[RUDP_MAX_PACKET_SIZE]; // ����һ��������ݰ���С�Ļ�����
+	UCHAR* p; // ��ǰ����ָ��
+	UCHAR* iv; // ��ʼ������ָ��
+	LIST* o = NULL; // ��ʱ�б������ڴ洢��ҪACK�����к�
+	UINT i; // ѭ������
+	UCHAR padlen; // ��䳤��
+	UINT current_size; // ��ǰ���ݰ���С
+	UCHAR sign[SHA1_SIZE]; // ǩ��
+	UCHAR key[SHA1_SIZE]; // ������Կ
+	UCHAR keygen[SHA1_SIZE * 2]; // ��Կ���ɻ�����
+	CRYPT* c; // ����������
+	UINT next_iv_pos; // ��һ��IV��λ��
+	UINT num_ack; // ��ҪACK�����к�����
+	UINT icmp_type = 0; // ICMP����
+
+	// ������֤
 	if (r == NULL || se == NULL || (size != 0 && data == NULL) || (size > RUDP_MAX_SEGMENT_SIZE))
 	{
-		return;
+		return; // ���r��seΪ�գ����ߵ�size�����dataΪ�գ�����size������������ݶδ�С����ֱ�ӷ���
 	}
 
+	// ��ʼ�����ݰ�������
 	Zero(dst, sizeof(dst));
 	p = dst;
 
-	// SIGN
+	// ǩ��
 	Copy(p, se->Key_Send, SHA1_SIZE);
 	p += SHA1_SIZE;
 
-	// IV
+	// ��ʼ������
 	iv = p;
 	Copy(iv, se->NextIv, SHA1_SIZE);
 	p += SHA1_SIZE;
 
+	// ����ACK�б�
 	for (i = 0; i < MIN(LIST_NUM(se->ReplyAckList), RUDP_MAX_NUM_ACK); i++)
 	{
-		UINT64 *seq = LIST_DATA(se->ReplyAckList, i);
+		UINT64* seq = LIST_DATA(se->ReplyAckList, i);
 
 		if (o == NULL)
 		{
@@ -3436,49 +3480,48 @@ void RUDPSendSegmentNow(RUDP_STACK *r, RUDP_SESSION *se, UINT64 seq_no, void *da
 		Add(o, seq);
 	}
 
-	// MyTick
+	// ��ǰʱ���
 	WRITE_UINT64(p, r->Now);
 	p += sizeof(UINT64);
 
-	// YourTick
+	// �Է�ʱ���
 	WRITE_UINT64(p, se->YourTick);
 	p += sizeof(UINT64);
 
-	// MAX_ACK
+	// �����ɽ��յ����к�
 	WRITE_UINT64(p, se->LastRecvCompleteSeqNo);
 	p += sizeof(UINT64);
 
-	// NUM_ACK
+	// ��ҪACK������
 	num_ack = LIST_NUM(o);
 	WRITE_UINT(p, num_ack);
 	p += sizeof(UINT);
 
 	if (o != NULL)
 	{
-		// ACK body
+		// ACK����
 		for (i = 0; i < LIST_NUM(o); i++)
 		{
-			UINT64 *seq = LIST_DATA(o, i);
+			UINT64* seq = LIST_DATA(o, i);
 
 			WRITE_UINT64(p, *seq);
 			p += sizeof(UINT64);
 
 			Delete(se->ReplyAckList, seq);
-
 			Free(seq);
 		}
 		ReleaseList(o);
 	}
 
-	// SEQ
+	// ���к�
 	WRITE_UINT64(p, seq_no);
 	p += sizeof(UINT64);
 
-	// data
+	// ����
 	Copy(p, data, size);
 	p += size;
 
-	// padding
+	// ���
 	padlen = Rand8();
 	padlen = MAX(padlen, 1);
 
@@ -3490,7 +3533,7 @@ void RUDPSendSegmentNow(RUDP_STACK *r, RUDP_SESSION *se, UINT64 seq_no, void *da
 
 	current_size = (UINT)(p - dst);
 
-	// Encrypt
+	// ����
 	Copy(keygen + 0, iv, SHA1_SIZE);
 	Copy(keygen + SHA1_SIZE, se->Key_Send, SHA1_SIZE);
 	Sha1(key, keygen, sizeof(keygen));
@@ -3498,7 +3541,7 @@ void RUDPSendSegmentNow(RUDP_STACK *r, RUDP_SESSION *se, UINT64 seq_no, void *da
 	Encrypt(c, dst + SHA1_SIZE * 2, dst + SHA1_SIZE * 2, current_size - (SHA1_SIZE * 2));
 	FreeCrypt(c);
 
-	// Sign
+	// ǩ��
 	Sha1(sign, dst, current_size);
 	if (r->Protocol == RUDP_PROTOCOL_DNS || r->Protocol == RUDP_PROTOCOL_ICMP)
 	{
@@ -3514,6 +3557,8 @@ void RUDPSendSegmentNow(RUDP_STACK *r, RUDP_SESSION *se, UINT64 seq_no, void *da
 	{
 		icmp_type = se->Dns_TranId;
 	}
+
+	// �������ݰ�
 	RUDPSendPacket(r, &se->YourIp, se->YourPort, dst, current_size, icmp_type);
 
 	if (size >= 1)
@@ -3521,17 +3566,17 @@ void RUDPSendSegmentNow(RUDP_STACK *r, RUDP_SESSION *se, UINT64 seq_no, void *da
 		se->LastSentTick = r->Now;
 	}
 
-	// Next IV
+	// ������һ��IV
 	next_iv_pos = Rand32() % (current_size - SHA1_SIZE);
 	Copy(se->NextIv, dst + next_iv_pos, SHA1_SIZE);
 
-#ifdef	RUDP_DETAIL_LOG
+#ifdef RUDP_DETAIL_LOG
 	Debug("RUDP %X Segment Sent: %I64u (num_ack=%u, size=%u)\n", se, seq_no, num_ack, size);
 #endif	// RUDP_DETAIL_LOG
 
 	if (size >= 1)
 	{
-#ifdef	RUDP_DETAIL_LOG
+#ifdef RUDP_DETAIL_LOG
 		Debug("Send Size: %X %I64u %u %u\n", se, seq_no, size, current_size);
 #endif	// RUDP_DETAIL_LOG
 	}
@@ -11089,7 +11134,7 @@ SOCK *NewUDP(UINT port)
 }
 SOCK *NewUDPEx(UINT port, bool ipv6)
 {
-	return NewUDPEx2(port, ipv6, NULL);
+	return NewUDPEx2(port, ipv6, NULL);		
 }
 SOCK *NewUDPEx2(UINT port, bool ipv6, IP *ip)
 {
@@ -11415,116 +11460,132 @@ bool RecvAllWithDiscard(SOCK *sock, UINT size, bool secure)
 }
 
 // Receive all by TCP
-bool RecvAll(SOCK *sock, void *data, UINT size, bool secure)
+bool RecvAll(SOCK* sock, void* data, UINT size, bool secure)
 {
 	UINT recv_size, sz, ret;
-	// Validate arguments
+
+	// ��֤����
 	if (sock == NULL || data == NULL)
 	{
-		return false;
-	}
-	if (size == 0)
-	{
-		return true;
-	}
-	if (sock->AsyncMode)
-	{
-		return false;
+		return false; // ���sock��dataΪ�գ�����false
 	}
 
-	recv_size = 0;
+	if (size == 0)
+	{
+		return true; // ���sizeΪ0����ζ�Ų���Ҫ�������ݣ�ֱ�ӷ���true
+	}
+
+	if (sock->AsyncMode)
+	{
+		return false; // ����׽��ִ����첽ģʽ������false
+	}
+
+	recv_size = 0; // ��ʼ���ѽ������ݴ�СΪ0
 
 	while (true)
 	{
-		sz = size - recv_size;
-		ret = Recv(sock, (UCHAR *)data + recv_size, sz, secure);
+		sz = size - recv_size; // ����ʣ����Ҫ���յ����ݴ�С
+		ret = Recv(sock, (UCHAR*)data + recv_size, sz, secure); // ���Խ�������
+
 		if (ret == 0)
 		{
-			return false;
+			return false; // �������ʧ�ܣ�retΪ0��������false
 		}
+
 		if (ret == SOCK_LATER)
 		{
-			// I suppose that this is safe because the RecvAll() function is used only
-			// if the sock->AsyncMode == true. And the Recv() function may return
-			// SOCK_LATER only if the sock->AsyncMode == false. Therefore the call of
-			// Recv() function in the RecvAll() function never returns SOCK_LATER.
+			// ע�����ᵽ��RecvAll()����sock->AsyncModeΪtrueʱʹ�ã�
+			// ��Recv()ֻ����sock->AsyncModeΪfalseʱ�Ż᷵��SOCK_LATER��
+			// ��ˣ�������Ϊ���ǲ����ܷ����ģ���Ϊ�˰�ȫ���������false��
 			return false;
 		}
-		recv_size += ret;
+
+		recv_size += ret; // �����ѽ��յ����ݴ�С
 		if (recv_size >= size)
 		{
-			return true;
+			return true; // ����ѽ��յ����ݴﵽ�򳬹�Ԥ�ڴ�С������true
 		}
 	}
 }
 
-// Send the TCP send buffer
-bool SendNow(SOCK *sock, int secure)
+// ����TCP���ͻ������е�����
+bool SendNow(SOCK* sock, int secure)
 {
 	bool ret;
-	// Validate arguments
+
+	// ������֤
 	if (sock == NULL || sock->AsyncMode != false)
 	{
-		return false;
+		return false; // ���sockΪ�ջ��׽��ִ����첽ģʽ������false
 	}
+
 	if (sock->SendBuf->Size == 0)
 	{
-		return true;
+		return true; // ������ͻ�����Ϊ�գ���ʾ���跢�����ݣ�ֱ�ӷ���true
 	}
 
+	// ���Է�����������
 	ret = SendAll(sock, sock->SendBuf->Buf, sock->SendBuf->Size, secure);
+
+	// ��շ��ͻ�����
 	ClearBuf(sock->SendBuf);
 
-	return ret;
+	return ret; // ���ط��ͽ��
 }
 
-// Append to the TCP send buffer
-void SendAdd(SOCK *sock, void *data, UINT size)
+// ������׷�ӵ�TCP���ͻ�����
+void SendAdd(SOCK* sock, void* data, UINT size)
 {
-	// Validate arguments
+	// ������֤
 	if (sock == NULL || data == NULL || size == 0 || sock->AsyncMode != false)
 	{
-		return;
+		return; // ���sockΪ�ա�dataΪ�ա�sizeΪ0�����׽��ִ����첽ģʽ����ֱ�ӷ���
 	}
 
+	// ������׷�ӵ����ͻ�����
 	WriteBuf(sock->SendBuf, data, size);
 }
 
-// Send all by TCP
-bool SendAll(SOCK *sock, void *data, UINT size, bool secure)
+// ͨ��TCP������������
+bool SendAll(SOCK* sock, void* data, UINT size, bool secure)
 {
-	UCHAR *buf;
-	UINT sent_size;
-	UINT ret;
-	// Validate arguments
+	UCHAR* buf; // ����һ��UCHAR���͵�ָ�룬����ָ������͵�����
+	UINT sent_size; // �ѷ��͵����ݴ�С
+	UINT ret; // ���η��͵�ʵ�ʴ�С
+
+	// ������֤
 	if (sock == NULL || data == NULL)
 	{
-		return false;
-	}
-	if (sock->AsyncMode)
-	{
-		return false;
-	}
-	if (size == 0)
-	{
-		return true;
+		return false; // ���sock��dataΪ�գ�����false
 	}
 
-	buf = (UCHAR *)data;
-	sent_size = 0;
+	if (sock->AsyncMode)
+	{
+		return false; // ����׽��ִ����첽ģʽ������false
+	}
+
+	if (size == 0)
+	{
+		return true; // ���sizeΪ0����ζ�Ų���Ҫ�������ݣ�ֱ�ӷ���true
+	}
+
+	buf = (UCHAR*)data; // ��dataת��ΪUCHAR���͵�ָ��
+	sent_size = 0; // ��ʼ���ѷ��͵����ݴ�СΪ0
 
 	while (true)
 	{
-		ret = Send(sock, buf, size - sent_size, secure);
+		ret = Send(sock, buf, size - sent_size, secure); // ���Է�������
 		if (ret == 0)
 		{
-			return false;
+			return false; // �������ʧ�ܣ�retΪ0��������false
 		}
-		sent_size += ret;
-		buf += ret;
+
+		sent_size += ret; // �����ѷ��͵����ݴ�С
+		buf += ret; // ��������ָ�룬ʹ��ָ��ʣ��δ���͵����ݲ���
+
 		if (sent_size >= size)
 		{
-			return true;
+			return true; // ����ѷ��͵����ݴ�С�ﵽ�򳬹�Ԥ�ڴ�С������true
 		}
 	}
 }
@@ -15498,7 +15559,23 @@ void CleanupSock(SOCK *s)
 }
 
 // Creating a new socket
-SOCK *NewSock()
+// SOCK *NewSock()
+// {
+// 	SOCK *s = ZeroMallocFast(sizeof(SOCK));
+
+// 	s->ref = NewRef();
+// 	s->lock = NewLock();
+// 	s->SendBuf = NewBuf();
+// 	s->socket = INVALID_SOCKET;
+// 	s->ssl_lock = NewLock();
+// 	s->disconnect_lock = NewLock();
+
+// 	Inc(num_tcp_connections);
+
+// 	return s;
+// }
+// 添加一个枚举类型来表示协议
+SOCK *NewSock(UINT protocol_type)
 {
 	SOCK *s = ZeroMallocFast(sizeof(SOCK));
 
@@ -15508,6 +15585,22 @@ SOCK *NewSock()
 	s->socket = INVALID_SOCKET;
 	s->ssl_lock = NewLock();
 	s->disconnect_lock = NewLock();
+
+	switch (protocol_type)
+	{
+		case SOCK_UDP:
+			s->Type = SOCK_UDP;
+			s->UdpMaxMsgSize = UDP_MAX_MSG_SIZE_DEFAULT;
+			break;
+		case SOCK_MQTT:
+			s->Type = SOCK_TCP;
+			s->UseMQTT = true;
+			InitMqttSock(&s->mqtt_sock);
+			break;
+		default:
+			s->Type = SOCK_TCP;
+			break;
+	}
 
 	Inc(num_tcp_connections);
 
