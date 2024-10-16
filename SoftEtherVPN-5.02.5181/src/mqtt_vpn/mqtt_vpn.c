@@ -32,11 +32,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#include "MQTTClient.h"
-
-#ifdef USE_SODIUM
-#include "sodium.h"
-#endif
+#include "Mayaqua/MQTTClient.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -97,10 +93,10 @@ int net2tap = 0;
 
 // Windows-specific TUN/TAP device allocation
 HANDLE tun_alloc(char *dev, int flags) {
-    // This function needs to be implemented for Windows
-    // It should create and open a TUN/TAP device
-    // For now, we'll just return INVALID_HANDLE_VALUE
-    return INVALID_HANDLE_VALUE;
+    // 这里需要实现 Windows 版本的 TUN/TAP 设备分配
+    // 可能需要使用 CreateFile 和 DeviceIoControl
+    // 返回设备句柄
+    return INVALID_HANDLE_VALUE; // 临时返回
 }
 
 int cread(HANDLE fd, unsigned char *buf, int n) {
