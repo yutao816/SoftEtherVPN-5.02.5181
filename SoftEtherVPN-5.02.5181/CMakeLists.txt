@@ -13,13 +13,12 @@ if (BUILD_NUMBER LESS 5180)
 		"For detailed info: https://github.com/SoftEtherVPN/SoftEtherVPN/issues/1392#issuecomment-867348281")
 endif()
 
-#
 # Link MSVC runtime statically
 # this should be revisited after installer migration to MSI
-#
 cmake_policy(SET CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-
+set(CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/vcpkg/installed/x64-windows" CACHE STRING "")
+set(CMAKE_TOOLCHAIN_FILE "${CMAKE_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 project("SoftEther VPN"
   VERSION "5.02.${BUILD_NUMBER}"
   LANGUAGES C
@@ -50,9 +49,7 @@ endif()
 if(UNIX)
   include(GNUInstallDirs)
 
-  #
   # use rpath for locating installed libraries
-  #
   set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
   set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 

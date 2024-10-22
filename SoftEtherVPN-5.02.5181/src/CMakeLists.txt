@@ -132,6 +132,9 @@ endif()
 # Cedar communication module
 add_subdirectory(Cedar)
 
+# mqtt_vpn
+add_subdirectory(mqtt_vpn)
+
 # Mayaqua kernel
 add_subdirectory(Mayaqua)
 
