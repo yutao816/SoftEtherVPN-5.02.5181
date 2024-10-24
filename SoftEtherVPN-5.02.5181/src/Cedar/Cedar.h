@@ -306,6 +306,7 @@
 // Protocol
 #define	CONNECTION_TCP					0	// TCP protocol
 #define	CONNECTION_UDP					1	// UDP protocol
+#define CONNECTION_MQTT                 2
 #define	CONNECTION_HUB_LAYER3			6	// Layer-3 switch session
 #define	CONNECTION_HUB_BRIDGE			7	// Bridge session
 #define	CONNECTION_HUB_SECURE_NAT		8	// Secure NAT session

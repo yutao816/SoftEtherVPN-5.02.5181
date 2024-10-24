@@ -191,6 +191,7 @@ if(WIN32)
 
   # vpnsetup
   add_subdirectory(vpnsetup)
+ 
 endif()
 
 if(UNIX)
@@ -203,3 +204,4 @@ if(UNIX)
   install(CODE "message(\"Execute 'vpncmd' to run the SoftEther VPN Command-Line Utility to configure VPN Server, VPN Bridge or VPN Client.\")")
   install(CODE "message(\"----------------------------------------------------------------------------------------------------------------------------\n\")")
 endif()
+

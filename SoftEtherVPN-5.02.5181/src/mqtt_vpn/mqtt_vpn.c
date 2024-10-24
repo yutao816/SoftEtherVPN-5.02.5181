@@ -35,7 +35,9 @@
 #include <openssl/err.h>
 #include "MQTTClient.h"
 #include <sodium.h>  // 确保 sodium.h 在正确的路径中
-
+#include "Cedar/Connection.h"
+#include "Cedar/Cedar.h"
+#include "Cedar/Session.h"
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "libssl.lib")
@@ -77,6 +79,7 @@ int net2tap = 0;
 
 int optind = 1;
 char *optarg = NULL;
+
 // //mqtt函数调用
 // void run_mqtt_vpn(int use_mqtt, const char *if_name, const char *if_addr, const char *broker) {
 //     // 初始化和设置代码
@@ -264,81 +267,145 @@ void usage(void)
   fprintf(stderr, "-h: prints this help text\n");
   exit(1);
 }
-int main(int argc, char *argv[]) {
-    // ... 其他代码保持不变
 
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        fprintf(stderr, "WSAStartup failed.\n");
-        return 1;
+// MQTT client handle
+MQTTClient mqtt_client;
+
+// MQTT connection options
+MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+
+// MQTT message arrived callback
+int messageArrived(void *context, char *topicName, int topicLen, MQTTClient_message *message) {
+    // Handle received MQTT message
+    // ... implement message handling logic ...
+    MQTTClient_freeMessage(&message);
+    MQTTClient_free(topicName);
+    return 1;
+}
+
+// Initialize MQTT connection
+int init_mqtt(const char *broker, const char *clientid) {
+    int rc;
+    MQTTClient_create(&mqtt_client, broker, clientid, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    conn_opts.keepAliveInterval = 20;
+    conn_opts.cleansession = 1;
+
+    MQTTClient_setCallbacks(mqtt_client, NULL, NULL, messageArrived, NULL);
+
+    if ((rc = MQTTClient_connect(mqtt_client, &conn_opts)) != MQTTCLIENT_SUCCESS) {
+        fprintf(stderr, "Failed to connect to MQTT broker, return code %d\n");
+        return 0;
+    }
+    return 1;
+}
+
+// Send MQTT message
+int send_mqtt_message(const char *topic, const void *payload, int payload_len) {
+    MQTTClient_message pubmsg = MQTTClient_message_initializer;
+    pubmsg.payload = (void*)payload;
+    pubmsg.payloadlen = payload_len;
+    pubmsg.qos = 0;
+    pubmsg.retained = 0;
+    return MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+}
+
+// MQTT VPN main loop
+void run_mqtt_vpn(CONNECTION *c) {
+    char clientid[50];
+    snprintf(clientid, sizeof(clientid), "MQTT_VPN_%d", rand());
+    
+    if (!init_mqtt(c->ServerName, clientid)) {
+        return;
     }
 
-    // 初始化 OpenSSL
-    SSL_library_init();
-    SSL_load_error_strings();
+    while (!c->Halt) {
+        MQTTClient_yield();
 
-    // 创建 TAP 设备
-    tap_fd = tun_alloc(if_name, IFF_TAP | IFF_NO_PI);
-    if (tap_fd == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Error creating TAP device.\n");
-        WSACleanup();
-        return 1;
-    }
-
-    // 设置 IP 地址和子网掩码
-    ULONG NTEContext = 0;
-    ULONG NTEInstance = 0;
-    DWORD dwRetVal;
-
-    struct sockaddr_in sin;
-    sin.sin_family = AF_INET;
-    if (InetPton(AF_INET, if_addr, &sin.sin_addr) != 1) {
-        fprintf(stderr, "Invalid IP address format.\n");
-        return 1;
-    }
-
-    ULONG netmask_addr;
-    if (InetPton(AF_INET, netmask, &netmask_addr) != 1) {
-        fprintf(stderr, "Invalid netmask format.\n");
-        return 1;
-    }
-
-    dwRetVal = AddIPAddress(sin.sin_addr.s_addr, netmask_addr, if_index, &NTEContext, &NTEInstance);
-    if (dwRetVal != NO_ERROR) {
-        fprintf(stderr, "AddIPAddress failed with error: %lu\n", dwRetVal);
-        CloseHandle(tap_fd);
-        WSACleanup();
-        return 1;
-    }
-
-    // ... 其他代码保持不变
-
-    while (1) {
-        DWORD waitResult = WaitForSingleObject(tap_fd, INFINITE);
-
-        switch (waitResult) {
-            case WAIT_OBJECT_0:
-                // tap_fd is ready for reading
-                // 处理 TAP 设备数据
-                // ... 处理数据的代码保持不变
-                break;
-
-            case WAIT_FAILED:
-                fprintf(stderr, "WaitForSingleObject failed with error: %lu\n", GetLastError());
-                break;
-
-            default:
-                // 处理其他情况
-                break;
+        BLOCK *b;
+        while ((b = GetNextBlock(c->SendBlocks)) != NULL) {
+            MQTTClient_publish(c->MqttClient, c->MqttTopic, b->Size, b->Buf, c->MqttQoS, 0, NULL);
+            FreeBlock(b);
         }
 
-        // 处理 MQTT 消息
-        MQTTClient_yield();
+        SleepThread(100);
     }
 
+    MQTTClient_disconnect(c->MqttClient, 10000);
+    MQTTClient_destroy(&c->MqttClient);
+}
+typedef struct {
+    BLOCK **blocks;
+    int capacity;
+    int size;
+    int front;
+    int rear;
+} SimpleQueue;
+
+SimpleQueue* NewSimpleQueue(int capacity) {
+    SimpleQueue* queue = (SimpleQueue*)malloc(sizeof(SimpleQueue));
+    if (queue == NULL) return NULL;
+    queue->blocks = (BLOCK**)malloc(sizeof(BLOCK*) * capacity);
+    if (queue->blocks == NULL) {
+        free(queue);
+        return NULL;
+    }
+    queue->capacity = capacity;
+    queue->size = 0;
+    queue->front = 0;
+    queue->rear = -1;
+    return queue;
+}
+// 主函数
+int main(int argc, char *argv[])
+{
+    char *if_name = NULL;
+    char *if_addr = NULL;
+    char *broker = NULL;
+    bool use_mqtt = true;  // 或者根据命令行参数设置
+
+    // 解析命令行参数，设置 if_name, if_addr 和 broker
+    // ... 在这里添加参数解析代码 ...
+
+    if (use_mqtt)
+{
+    CONNECTION *c = NewServerConnection(NULL, NULL, NULL);
+    if (c == NULL)
+    {
+        fprintf(stderr, "Failed to create new connection\n");
+        return 1;
+    }
+    
+    // 设置必要的 CONNECTION 字段
+    strncpy(c->ServerName, broker, sizeof(c->ServerName) - 1);
+    c->ServerName[sizeof(c->ServerName) - 1] = '\0';
+    c->Halt = false;
+    c->ServerPort = 1883;  // MQTT 默认端口
+    
+    // 初始化 MQTT 相关字段
+    c->UseMqtt = true;
+    c->MqttTopic = strdup("your/mqtt/topic");
+    if (c->MqttTopic == NULL) {
+        fprintf(stderr, "Failed to allocate memory for MqttTopic\n");
+        ReleaseConnection(c);
+        return 1;
+    }
+    c->MqttQoS = 0;
+    
+    // 初始化 SendBlocks 队列
+    c->SendBlocks = (QUEUE*)NewSimpleQueue(100);
+    if (c->SendBlocks == NULL) {
+        fprintf(stderr, "Failed to create SendBlocks queue\n");
+        free(c->MqttTopic);
+        ReleaseConnection(c);
+        return 1;
+    }
+    
+    // 运行 MQTT VPN
+    run_mqtt_vpn(c);
+    
     // 清理资源
-    DeleteIPAddress(NTEContext);
-    CloseHandle(tap_fd);
-    WSACleanup();
+    ReleaseConnection(c);
+}
+
     return 0;
 }

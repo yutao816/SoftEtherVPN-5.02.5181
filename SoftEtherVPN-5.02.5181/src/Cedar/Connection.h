@@ -9,7 +9,7 @@
 #define	CONNECTION_H
 
 #include "Cedar.h"
-
+#include "MQTTClient.h"
 #include "Mayaqua/Encrypt.h"
 #include "Mayaqua/Proxy.h"
 
@@ -247,6 +247,11 @@ struct CONNECTION
 	bool IsJsonRpc;					// Is JSON-RPC
 	bool JsonRpcAuthed;				// JSON-RPC Authed
 	LISTENER *Listener;				// Listener ref
+	bool UseMqtt;
+    char *MqttTopic;
+    int MqttQoS;
+    MQTTClient MqttClient;
+	
 };
 
 

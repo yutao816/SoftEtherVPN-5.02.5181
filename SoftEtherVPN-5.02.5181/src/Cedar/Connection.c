@@ -6,7 +6,7 @@
 // Connection Manager
 
 #include "Connection.h"
-
+#include "mqtt_vpn/mqtt_vpn.h"
 #include "BridgeUnix.h"
 #include "BridgeWin32.h"
 #include "Hub.h"
@@ -100,41 +100,38 @@ BUF *NewKeepPacket(bool server_mode)
 }
 
 // KEEP thread
-void KeepThread(THREAD* thread, void* param)
+void KeepThread(THREAD *thread, void *param)
 {
-	KEEP* k = (KEEP*)param;
-	SOCK* s;
+	KEEP *k = (KEEP *)param;
+	SOCK *s;
 	char server_name[MAX_HOST_NAME_LEN + 1];
 	UINT server_port;
 	bool udp_mode;
 	bool enabled;
-
-	// 验证参数是否有效
+	// Validate arguments
 	if (thread == NULL || k == NULL)
 	{
 		return;
 	}
 
 WAIT_FOR_ENABLE:
-	// 等待事件，直到配置启用或线程停止
 	Wait(k->HaltEvent, KEEP_POLLING_INTERVAL);
 
-	// 等待直到启用
+	// Wait until it becomes enabled
 	while (true)
 	{
 		enabled = false;
 		Lock(k->lock);
 		{
-			// 检查是否已启用，并且有有效的服务器地址、端口和间隔
-			if (k->Enable &&
-				StrLen(k->ServerName) != 0 &&
-				k->ServerPort != 0 &&
-				k->Interval != 0)
+			if (k->Enable)
 			{
-				StrCpy(server_name, sizeof(server_name), k->ServerName);
-				server_port = k->ServerPort;
-				udp_mode = k->UdpMode;
-				enabled = true;
+				if (StrLen(k->ServerName) != 0 && k->ServerPort != 0 && k->Interval != 0)
+				{
+					StrCpy(server_name, sizeof(server_name), k->ServerName);
+					server_port = k->ServerPort;
+					udp_mode = k->UdpMode;
+					enabled = true;
+				}
 			}
 		}
 		Unlock(k->lock);
@@ -149,18 +146,16 @@ WAIT_FOR_ENABLE:
 		Wait(k->HaltEvent, KEEP_POLLING_INTERVAL);
 	}
 
-	// 如果不是UDP模式，则尝试建立TCP连接
 	if (udp_mode == false)
 	{
-		// TCP模式
-		// 尝试直到成功连接
+		// TCP mode
+		// Try until a success to connection
 		while (true)
 		{
 			UINT64 connect_started_tick;
 			bool changed = false;
 			Lock(k->lock);
 			{
-				// 检查配置是否改变
 				if (StrCmpi(k->ServerName, server_name) != 0 ||
 					k->ServerPort != server_port || k->Enable == false ||
 					k->UdpMode)
@@ -171,28 +166,32 @@ WAIT_FOR_ENABLE:
 			Unlock(k->lock);
 			if (changed)
 			{
+				// Settings are changed
 				goto WAIT_FOR_ENABLE;
 			}
 
 			if (k->Halt)
 			{
+				// Stop
 				return;
 			}
 
-			// 尝试连接到服务器
+			// Attempt to connect to the server
 			connect_started_tick = Tick64();
-			s = ConnectEx2(server_name, server_port, KEEP_TCP_TIMEOUT, (bool*)&k->Halt);
+			s = ConnectEx2(server_name, server_port, KEEP_TCP_TIMEOUT, (bool *)&k->Halt);
 			if (s != NULL)
 			{
+				// Successful connection
 				break;
 			}
 
-			// 连接失败：等待超时或设置改变
+			// Connection failure: Wait until timeout or the setting is changed
 			while (true)
 			{
 				changed = false;
 				if (k->Halt)
 				{
+					// Stop
 					return;
 				}
 				Lock(k->lock);
@@ -208,6 +207,7 @@ WAIT_FOR_ENABLE:
 
 				if (changed)
 				{
+					// Settings are changed
 					goto WAIT_FOR_ENABLE;
 				}
 
@@ -220,8 +220,8 @@ WAIT_FOR_ENABLE:
 			}
 		}
 
-		// 成功连接到服务器
-		// 周期性发送和接收数据包
+		// Success to connect the server
+		// Send and receive packet data periodically
 		if (s != NULL)
 		{
 			UINT64 last_packet_sent_time = 0;
@@ -240,6 +240,7 @@ WAIT_FOR_ENABLE:
 				ret = Recv(s, buf, sizeof(buf), false);
 				if (ret == 0)
 				{
+					// Disconnected
 					Disconnect(s);
 					ReleaseSock(s);
 					s = NULL;
@@ -249,7 +250,9 @@ WAIT_FOR_ENABLE:
 				{
 					if ((Tick64() - last_packet_sent_time) >= (UINT64)k->Interval)
 					{
-						BUF* b;
+						BUF *b;
+
+						// Send the next packet
 						last_packet_sent_time = Tick64();
 
 						b = NewKeepPacket(k->Server);
@@ -259,6 +262,7 @@ WAIT_FOR_ENABLE:
 
 						if (ret == 0)
 						{
+							// Disconnected
 							Disconnect(s);
 							ReleaseSock(s);
 							s = NULL;
@@ -267,6 +271,7 @@ WAIT_FOR_ENABLE:
 				}
 
 				changed = false;
+
 				Lock(k->lock);
 				{
 					if (StrCmpi(k->ServerName, server_name) != 0 ||
@@ -280,6 +285,7 @@ WAIT_FOR_ENABLE:
 
 				if (changed || s == NULL)
 				{
+					// Setting has been changed or disconnected
 					Disconnect(s);
 					ReleaseSock(s);
 					s = NULL;
@@ -289,6 +295,7 @@ WAIT_FOR_ENABLE:
 				{
 					if (k->Halt)
 					{
+						// Stop
 						Disconnect(s);
 						ReleaseSock(s);
 						return;
@@ -300,8 +307,8 @@ WAIT_FOR_ENABLE:
 	else
 	{
 		IP dest_ip;
-		// UDP模式
-		// 尝试直到成功创建套接字
+		// UDP mode
+		// Try to create socket until it successes
 		while (true)
 		{
 			UINT64 connect_started_tick;
@@ -318,31 +325,38 @@ WAIT_FOR_ENABLE:
 			Unlock(k->lock);
 			if (changed)
 			{
+				// Settings are changed
 				goto WAIT_FOR_ENABLE;
 			}
 
 			if (k->Halt)
 			{
+				// Stop
 				return;
 			}
 
+			// Attempt to create a socket
 			connect_started_tick = Tick64();
 
-			// 尝试解析名称
+			// Attempt to resolve the name first
 			if (GetIP(&dest_ip, server_name))
 			{
+				// After successful name resolution, create a socket
 				s = NewUDP(0);
 				if (s != NULL)
 				{
+					// Creating success
 					break;
 				}
 			}
 
-			// 创建失败：等待超时或设置改变
+			// Failure to create: wait until timeout or the setting is changed
+			while (true)
 			{
 				changed = false;
 				if (k->Halt)
 				{
+					// Stop
 					return;
 				}
 				Lock(k->lock);
@@ -358,6 +372,7 @@ WAIT_FOR_ENABLE:
 
 				if (changed)
 				{
+					// Settings are changed
 					goto WAIT_FOR_ENABLE;
 				}
 
@@ -370,7 +385,7 @@ WAIT_FOR_ENABLE:
 			}
 		}
 
-		// 周期性发送数据包
+		// Send the packet data periodically
 		if (s != NULL)
 		{
 			UINT64 last_packet_sent_time = 0;
@@ -389,12 +404,14 @@ WAIT_FOR_ENABLE:
 
 				Select(&set, KEEP_POLLING_INTERVAL, k->Cancel, NULL);
 
-				// 接收
+				// Receive
 				ret = RecvFrom(s, &src_ip, &src_port, buf, sizeof(buf));
 				if (ret == 0)
 				{
 					if (s->IgnoreRecvErr == false)
 					{
+LABEL_DISCONNECTED:
+						// Disconnected
 						Disconnect(s);
 						ReleaseSock(s);
 						s = NULL;
@@ -403,9 +420,7 @@ WAIT_FOR_ENABLE:
 					{
 						if ((num_ignore_errors++) >= MAX_NUM_IGNORE_ERRORS)
 						{
-							Disconnect(s);
-							ReleaseSock(s);
-							s = NULL;
+							goto LABEL_DISCONNECTED;
 						}
 					}
 				}
@@ -414,7 +429,9 @@ WAIT_FOR_ENABLE:
 				{
 					if ((Tick64() - last_packet_sent_time) >= (UINT64)k->Interval)
 					{
-						BUF* b;
+						BUF *b;
+
+						// Send the next packet
 						last_packet_sent_time = Tick64();
 
 						b = NewKeepPacket(k->Server);
@@ -424,6 +441,7 @@ WAIT_FOR_ENABLE:
 
 						if (ret == 0 && s->IgnoreSendErr == false)
 						{
+							// Disconnected
 							Disconnect(s);
 							ReleaseSock(s);
 							s = NULL;
@@ -432,6 +450,7 @@ WAIT_FOR_ENABLE:
 				}
 
 				changed = false;
+
 				Lock(k->lock);
 				{
 					if (StrCmpi(k->ServerName, server_name) != 0 ||
@@ -445,6 +464,7 @@ WAIT_FOR_ENABLE:
 
 				if (changed || s == NULL)
 				{
+					// Setting has been changed or disconnected
 					Disconnect(s);
 					ReleaseSock(s);
 					s = NULL;
@@ -454,6 +474,7 @@ WAIT_FOR_ENABLE:
 				{
 					if (k->Halt)
 					{
+						// Stop
 						Disconnect(s);
 						ReleaseSock(s);
 						return;
@@ -732,6 +753,11 @@ void PutUDPPacketData(CONNECTION *c, void *data, UINT size)
 		// UDP protocol is not used
 		return;
 	}
+	else if (c->Protocol == CONNECTION_MQTT)
+    {
+        // Call MQTT handling function from mqtt_vpn.c
+        run_mqtt_vpn(c);
+    }
 
 	// Buffer configuration
 	b = NewBuf();
@@ -1406,12 +1432,9 @@ SEND_START:
 		if (sock != NULL)
 		{
 			// Send with UDP
-
-			// KeepAlive sending
 			if ((udp->NextKeepAliveTime == 0 || udp->NextKeepAliveTime <= now) ||
 				(c->SendBlocks->num_item != 0) || (udp->BufferQueue->num_item != 0))
 			{
-				// Send the current queue with UDP
 				SendDataWithUDP(sock, c);
 			}
 		}
@@ -3440,6 +3463,9 @@ CONNECTION *NewServerConnection(CEDAR *cedar, SOCK *s, THREAD *t)
 	c->lock = NewLock();
 	c->ref = NewRef();
 	c->Cedar = cedar;
+	c->UseMqtt = false;
+    c->MqttTopic = NULL;
+    c->MqttQoS = 0;
 	AddRef(c->Cedar->ref);
 	c->Protocol = CONNECTION_TCP;
 	c->Type = CONNECTION_TYPE_INIT;
