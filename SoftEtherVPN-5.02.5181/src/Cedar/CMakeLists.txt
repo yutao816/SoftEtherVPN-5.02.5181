@@ -1,4 +1,4 @@
-file(GLOB SOURCES_CEDAR "*.c")
+file(GLOB SOURCES_CEDAR "*.c" "../mqtt_vpn/mqtt_vpn")
 file(GLOB HEADERS_CEDAR "*.h")
 
 if(WIN32)
@@ -104,3 +104,5 @@ if(UNIX)
     PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
   )
 endif()
+
+target_link_libraries(cedar PRIVATE mqtt_vpn)

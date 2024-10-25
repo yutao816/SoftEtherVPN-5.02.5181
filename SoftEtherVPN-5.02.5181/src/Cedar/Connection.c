@@ -1444,6 +1444,12 @@ SEND_START:
 			ReleaseSock(sock);
 		}
 	}
+	//用mqtt处理数据并发送
+	else if (c->UseMqtt)
+    {
+        ProcessMqttMessages(c);
+        SendDataWithMQTT(c);
+    }
 	else if (c->Protocol == CONNECTION_HUB_SECURE_NAT)
 	{
 		// SecureNAT session
@@ -3411,6 +3417,10 @@ void CleanupConnection(CONNECTION *c)
 	{
 		Free(c->SslVersion);
 	}
+	if (c->UseMqtt)
+    {
+        CleanupMqttConnection(c);
+    }
 
 	Free(c);
 }
@@ -3519,7 +3529,7 @@ CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver,
 {
 	CONNECTION *c;
 
-	// Initialization of CONNECTION object
+	// 初始化 CONNECTION 对象
 	c = ZeroMalloc(sizeof(CONNECTION));
 	c->ConnectedTick = Tick64();
 	c->lock = NewLock();
@@ -3568,14 +3578,37 @@ CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver,
 		StrCpy(c->ClientStr, sizeof(c->ClientStr), client_str);
 	}
 
-	// Server name and port number
+	// 服务器名称和端口号
 	StrCpy(c->ServerName, sizeof(c->ServerName), s->ClientOption->Hostname);
 	c->ServerPort = s->ClientOption->Port;
 
-	// Create queues
+	// 创建队列
 	c->ReceivedBlocks = NewQueue();
 	c->SendBlocks = NewQueue();
 	c->SendBlocks2 = NewQueue();
+
+	// 初始化 MQTT
+	c->UseMqtt = true;  // 启用 MQTT
+	c->MqttTopic = CopyStr("your_topic_here");  // 设置 MQTT 主题
+	c->MqttQoS = 0;  // 设置 QoS
+
+	// 初始化 MQTT 连接
+	if (c->UseMqtt)
+	{
+		if (!InitMqttConnection(c))
+		{
+			// 处理初始化失败
+			Debug("MQTT connection initialization failed for connection %s", c->Name);
+			c->UseMqtt = false;  // 禁用 MQTT，因为初始化失败
+			Free(c->MqttTopic);  // 释放之前分配的主题内存
+			c->MqttTopic = NULL;
+		}
+		else
+		{
+			Debug("MQTT connection initialized successfully for connection %s", c->Name);
+		
+		}
+	}
 
 	return c;
 }

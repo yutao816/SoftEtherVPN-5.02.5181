@@ -12,7 +12,7 @@
 #include "MQTTClient.h"
 #include "Mayaqua/Encrypt.h"
 #include "Mayaqua/Proxy.h"
-
+#include "mqtt_vpn/mqtt_vpn.h"
 // Magic number indicating that the packet is compressed
 #define	CONNECTION_BULK_COMPRESS_SIGNATURE	0xDEADBEEFCAFEFACEULL
 
@@ -247,10 +247,10 @@ struct CONNECTION
 	bool IsJsonRpc;					// Is JSON-RPC
 	bool JsonRpcAuthed;				// JSON-RPC Authed
 	LISTENER *Listener;				// Listener ref
-	bool UseMqtt;
-    char *MqttTopic;
-    int MqttQoS;
-    MQTTClient MqttClient;
+	bool UseMqtt;                   // Flag to indicate if MQTT is used
+    char *MqttTopic;                // MQTT topic
+    int MqttQoS;                    // MQTT Quality of Service
+    void *MQTTClient; 
 	
 };
 
