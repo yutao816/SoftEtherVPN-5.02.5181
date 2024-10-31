@@ -11,7 +11,7 @@
 #define MICROSOFT_C
 
 #include "CMInner.h"
-#include "MQTTClient.h"
+
 #include "Nat.h"
 #include "Protocol.h"
 #include "Remote.h"
@@ -4195,17 +4195,8 @@ UINT CmMainWindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, void *p
 		}
 		break;
 	case WM_COMMAND:
-	     switch (wParam)
-        {
-	
 		CmMainWindowOnCommand(hWnd, wParam, lParam);
 		break;
-		case CMD_MQTT_CONFIG:
-                // 添加MQTT配置对话框
-                CmMQTTConfigDlg(hWnd);
-
-			  }
-        break;
 	case WM_SIZE:
 		CmMainWindowOnSize(hWnd);
 		break;
@@ -7377,7 +7368,6 @@ UINT CmEditAccountDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, voi
 		if (a->EditMode == false && a->LinkMode == false && a->NatMode == false)
 		{
 			SetTimer(hWnd, 1, 100, NULL);
-			Check(hWnd, R_USE_MQTT, a->ClientOption->UseMQTT);
 		}
 		break;
 	case WM_TIMER:
@@ -7709,10 +7699,7 @@ void CmProxyHttpHeaderDlgUpdate(HWND hWnd)
 	{
 		return;
 	}
-	
-    Hide(hWnd, R_DISABLE_UDP);
-    Show(hWnd, R_USE_MQTT);
-    a->ClientOption->UseMQTT = IsChecked(hWnd, R_USE_MQTT);
+
 	names_list = NewList(NULL);
 
 	for (; i < LvNum(hWnd, L_VALUES_LIST); i++)
