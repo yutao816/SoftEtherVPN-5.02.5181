@@ -1,5 +1,3 @@
-// mqtt_vpn.h
-
 #ifndef MQTT_VPN_H
 #define MQTT_VPN_H
 
@@ -13,26 +11,31 @@
 #define IFF_TAP     0x0002
 #define IFF_NO_PI   0x1000
 
+// MQTT 配置结构
+typedef struct {
+    char broker[256];
+    char topic[128];
+    int qos;
+    char client_id[50];
+} MQTT_CONFIG;
+
 // TUN_HANDLE 结构定义
 typedef struct {
     HANDLE vh_handle;    // VH 结构句柄
     SOCKET tap_socket;   // TAP 设备 socket
     CEDAR *cedar;        // Cedar 实例指针
+    MQTT_CONFIG mqtt;    // MQTT 配置
 } TUN_HANDLE;
 
 // 函数声明
-//TUN_HANDLE* tun_alloc(const char *if_name, int flags);
-void cleanup_tun(TUN_HANDLE* handle);
-bool init_softether(void);
-void cleanup_softether(void);
-int mqtt_vpn_start(int argc, char *argv[]);
-void usage(void);
-void cleanup_tun(TUN_HANDLE* handle);
-
-bool InitMqttConnection(CONNECTION *connection);
-void CleanupMqttConnection(CONNECTION *connection);
-void run_mqtt_vpn(CONNECTION *connection);
-int mqtt_vpn_init(void);
-void SendDataWithMQTT(CONNECTION *c);
+bool InitializeMqttConnection(CONNECTION *c, const char *broker, const char *topic);
+void CleanupMqttConnection(CONNECTION *c);
 void ProcessMqttMessages(CONNECTION *c);
+// 修改函数声明
+void SendDataWithMQTT(CONNECTION *c);  // 移除 BLOCK *b 参数
+// TAP 设备和配置相关函数
+TUN_HANDLE* CreateTunDevice(const char *if_name, const char *ip_addr);
+void CleanupTunDevice(TUN_HANDLE* handle);
+bool GetMqttConfig(MQTT_CONFIG *config);  // 获取用户配置
+
 #endif // MQTT_VPN_H

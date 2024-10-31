@@ -753,11 +753,7 @@ void PutUDPPacketData(CONNECTION *c, void *data, UINT size)
 		// UDP protocol is not used
 		return;
 	}
-	else if (c->Protocol == CONNECTION_MQTT)
-    {
-        // Call MQTT handling function from mqtt_vpn.c
-        run_mqtt_vpn(c);
-    }
+	
 
 	// Buffer configuration
 	b = NewBuf();
@@ -1447,7 +1443,6 @@ SEND_START:
 	//用mqtt处理数据并发送
 	else if (c->UseMqtt)
     {
-        ProcessMqttMessages(c);
         SendDataWithMQTT(c);
     }
 	else if (c->Protocol == CONNECTION_HUB_SECURE_NAT)
@@ -2393,6 +2388,11 @@ DISCONNECT_THIS_TCP:
 			Select(NULL, SELECT_TIME, c1, c2);
 		}
 	}
+	else if (c->Protocol == CONNECTION_MQTT)
+    {
+        ProcessMqttMessages(c);
+    }
+
 	else if (c->Protocol == CONNECTION_HUB_SECURE_NAT)
 	{
 		SNAT *snat = c->Session->SecureNAT;
@@ -3262,6 +3262,12 @@ void CleanupConnection(CONNECTION *c)
 		return;
 	}
 
+	// 如果是 MQTT 连接，先清理 MQTT 资源
+	if (c->Protocol == CONNECTION_MQTT)
+	{
+		CleanupMqttConnection(c);
+	}
+
 	if (c->LastRecvFifoTotalSize != 0)
 	{
 		CedarAddFifoBudget(c->Cedar, -((int)c->LastRecvFifoTotalSize));
@@ -3417,10 +3423,6 @@ void CleanupConnection(CONNECTION *c)
 	{
 		Free(c->SslVersion);
 	}
-	if (c->UseMqtt)
-    {
-        CleanupMqttConnection(c);
-    }
 
 	Free(c);
 }
@@ -3527,88 +3529,81 @@ CONNECTION *NewClientConnection(SESSION *s)
 }
 CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver, UINT client_build)
 {
-	CONNECTION *c;
+    CONNECTION *c;
 
-	// 初始化 CONNECTION 对象
-	c = ZeroMalloc(sizeof(CONNECTION));
-	c->ConnectedTick = Tick64();
-	c->lock = NewLock();
-	c->ref = NewRef();
-	c->Cedar = s->Cedar;
-	AddRef(c->Cedar->ref);
-	c->Protocol = CONNECTION_TCP;
-	c->Tcp = ZeroMalloc(sizeof(TCP));
-	c->Tcp->TcpSockList = NewList(NULL);
-	c->ServerMode = false;
-	c->Status = CONNECTION_STATUS_CONNECTING;
-	c->Name = CopyStr("CLIENT_CONNECTION");
-	c->Session = s;
-	c->CurrentNumConnection = NewCounter();
-	c->LastCounterResetTick = Tick64();
-	Inc(c->CurrentNumConnection);
+    // 初始化 CONNECTION 对象
+    c = ZeroMalloc(sizeof(CONNECTION));
+    c->ConnectedTick = Tick64();
+    c->lock = NewLock();
+    c->ref = NewRef();
+    c->Cedar = s->Cedar;
+    AddRef(c->Cedar->ref);
+    c->Protocol = CONNECTION_TCP;  // 默认使用 TCP
+    c->Tcp = ZeroMalloc(sizeof(TCP));
+    c->Tcp->TcpSockList = NewList(NULL);
+    c->ServerMode = false;
+    c->Status = CONNECTION_STATUS_CONNECTING;
+    c->Name = CopyStr("CLIENT_CONNECTION");
+    c->Session = s;
+    c->CurrentNumConnection = NewCounter();
+    c->LastCounterResetTick = Tick64();
+    Inc(c->CurrentNumConnection);
 
-	c->ConnectingThreads = NewList(NULL);
-	c->ConnectingSocks = NewList(NULL);
+    c->ConnectingThreads = NewList(NULL);
+    c->ConnectingSocks = NewList(NULL);
 
-	if (client_str == NULL)
-	{
-		c->ClientVer = s->Cedar->Version;
-		c->ClientBuild = s->Cedar->Build;
+    if (client_str == NULL)
+    {
+        c->ClientVer = s->Cedar->Version;
+        c->ClientBuild = s->Cedar->Build;
 
-		if (c->Session->VirtualHost == false)
-		{
-			if (c->Session->LinkModeClient == false)
-			{
-				StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_CLIENT_STR);
-			}
-			else
-			{
-				StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_SERVER_LINK_STR);
-			}
-		}
-		else
-		{
-			StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_ROUTER_STR);
-		}
-	}
-	else
-	{
-		c->ClientVer = client_ver;
-		c->ClientBuild = client_build;
-		StrCpy(c->ClientStr, sizeof(c->ClientStr), client_str);
-	}
+        if (c->Session->VirtualHost == false)
+        {
+            if (c->Session->LinkModeClient == false)
+            {
+                StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_CLIENT_STR);
+            }
+            else
+            {
+                StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_SERVER_LINK_STR);
+            }
+        }
+        else
+        {
+            StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_ROUTER_STR);
+        }
+    }
+    else
+    {
+        c->ClientVer = client_ver;
+        c->ClientBuild = client_build;
+        StrCpy(c->ClientStr, sizeof(c->ClientStr), client_str);
+    }
 
-	// 服务器名称和端口号
-	StrCpy(c->ServerName, sizeof(c->ServerName), s->ClientOption->Hostname);
-	c->ServerPort = s->ClientOption->Port;
+    // 服务器名称和端口号
+    StrCpy(c->ServerName, sizeof(c->ServerName), s->ClientOption->Hostname);
+    c->ServerPort = s->ClientOption->Port;
 
-	// 创建队列
-	c->ReceivedBlocks = NewQueue();
-	c->SendBlocks = NewQueue();
-	c->SendBlocks2 = NewQueue();
+    // 创建队列
+    c->ReceivedBlocks = NewQueue();
+    c->SendBlocks = NewQueue();
+    c->SendBlocks2 = NewQueue();
 
-	// 初始化 MQTT
-	c->UseMqtt = true;  // 启用 MQTT
-	c->MqttTopic = CopyStr("your_topic_here");  // 设置 MQTT 主题
-	c->MqttQoS = 0;  // 设置 QoS
+    // 尝试初始化 MQTT 连接
+    if (GetMqttUserConfig())  // 获取用户的 MQTT 配置
+    {
+        const MQTT_CONFIG* mqtt_config = GetCurrentMqttConfig();
+        if (InitializeMqttConnection(c, mqtt_config->broker, mqtt_config->topic))
+        {
+            Debug("MQTT: Connection initialized successfully for %s", c->Name);
+            c->Protocol = CONNECTION_MQTT;  // 切换到 MQTT 协议
+        }
+        else
+        {
+            Debug("MQTT: Connection initialization failed for %s", c->Name);
+            // 如果 MQTT 初始化失败，保持使用 TCP
+        }
+    }
 
-	// 初始化 MQTT 连接
-	if (c->UseMqtt)
-	{
-		if (!InitMqttConnection(c))
-		{
-			// 处理初始化失败
-			Debug("MQTT connection initialization failed for connection %s", c->Name);
-			c->UseMqtt = false;  // 禁用 MQTT，因为初始化失败
-			Free(c->MqttTopic);  // 释放之前分配的主题内存
-			c->MqttTopic = NULL;
-		}
-		else
-		{
-			Debug("MQTT connection initialized successfully for connection %s", c->Name);
-		
-		}
-	}
-
-	return c;
+    return c;
 }

@@ -25,7 +25,6 @@
 #include "../Cedar/CedarType.h"
 #include "../Cedar/Nat.h"
 
-
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "libssl.lib")
@@ -55,8 +54,8 @@
 #define IFF_TAP     0x0002
 #define IFF_NO_PI   0x1000
 
-// MQTT 连接选项
-MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+// 全局配置
+static MQTT_CONFIG g_mqtt_config = {0};
 
 // MQTT 消息到达回调函数
 int messageArrived(void *context, char *topicName, int topicLen, MQTTClient_message *message) {
@@ -73,57 +72,74 @@ int messageArrived(void *context, char *topicName, int topicLen, MQTTClient_mess
 }
 
 // 初始化 MQTT 连接
-int init_mqtt(CONNECTION *c, const char *clientid) {
-    int rc;
-    MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+bool InitializeMqttConnection(CONNECTION *c, const char *broker, const char *topic)
+{
+    if (c == NULL || broker == NULL || topic == NULL) {
+        return false;
+    }
+
+    // 保存配置
+    StrCpy(g_mqtt_config.broker, sizeof(g_mqtt_config.broker), broker);
+    StrCpy(g_mqtt_config.topic, sizeof(g_mqtt_config.topic), topic);
+    g_mqtt_config.qos = QOS;
+    snprintf(g_mqtt_config.client_id, sizeof(g_mqtt_config.client_id), 
+        "%s%d", CLIENTID_PRE, rand());
 
     // 创建 MQTT 客户端
-    rc = MQTTClient_create((MQTTClient*)&c->MQTTClient, c->ServerName, clientid, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    int rc = MQTTClient_create((MQTTClient*)&c->MQTTClient, broker, 
+        g_mqtt_config.client_id, MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (rc != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "Failed to create MQTT client, return code %d\n", rc);
-        return 0;
+        Debug("MQTT: Failed to create client, return code %d\n", rc);
+        return false;
     }
 
     // 设置连接选项
+    MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
     conn_opts.keepAliveInterval = 20;
     conn_opts.cleansession = 1;
 
     // 设置回调
     rc = MQTTClient_setCallbacks((MQTTClient)c->MQTTClient, c, NULL, messageArrived, NULL);
     if (rc != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "Failed to set callbacks, return code %d\n", rc);
-        return 0;
+        Debug("MQTT: Failed to set callbacks, return code %d\n", rc);
+        return false;
     }
 
     // 连接到 MQTT 服务器
     rc = MQTTClient_connect((MQTTClient)c->MQTTClient, &conn_opts);
     if (rc != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "Connection to MQTT server failed, return code %d\n", rc);
-        return 0;
+        Debug("MQTT: Connection failed, return code %d\n", rc);
+        return false;
     }
 
-    printf("MQTT connection successful\n");
-    return 1;
+    // 保存连接参数
+    StrCpy(c->ServerName, sizeof(c->ServerName), broker);
+    StrCpy(c->MqttTopic, sizeof(c->MqttTopic), topic);
+    c->MqttQoS = QOS;
+
+    Debug("MQTT: Connection successful\n");
+    return true;
 }
 
-void ProcessMqttMessages(CONNECTION *c) {
-    if (c->MQTTClient == NULL || !MQTTClient_isConnected((MQTTClient)c->MQTTClient)) {
-        char clientid[50];
-        snprintf(clientid, sizeof(clientid), "%s%d", CLIENTID_PRE, rand());
-        if (!init_mqtt(c, clientid)) {
-            return;
-        }
+// 处理 MQTT 消息
+void ProcessMqttMessages(CONNECTION *c) 
+{
+    if (c->MQTTClient != NULL) 
+    {
+        MQTTClient_yield();
     }
-
-     MQTTClient_yield();
 }
 
+// 发送数据
+void SendDataWithMQTT(CONNECTION *c) 
+{
+    if (c == NULL) return;
 
-
-void SendDataWithMQTT(CONNECTION *c) {
     BLOCK *b;
-    while ((b = GetNext(c->SendBlocks)) != NULL) {
-        if (c->MQTTClient && MQTTClient_isConnected((MQTTClient)c->MQTTClient)) {
+    while ((b = GetNext(c->SendBlocks)) != NULL) 
+    {
+        if (c->MQTTClient && MQTTClient_isConnected((MQTTClient)c->MQTTClient)) 
+        {
             MQTTClient_message pubmsg = MQTTClient_message_initializer;
             pubmsg.payload = b->Buf;
             pubmsg.payloadlen = b->Size;
@@ -131,381 +147,104 @@ void SendDataWithMQTT(CONNECTION *c) {
             pubmsg.retained = 0;
 
             MQTTClient_deliveryToken token;
-            int rc = MQTTClient_publishMessage((MQTTClient)c->MQTTClient, c->MqttTopic, &pubmsg, &token);
+            int rc = MQTTClient_publishMessage((MQTTClient)c->MQTTClient, 
+                c->MqttTopic, &pubmsg, &token);
             if (rc != MQTTCLIENT_SUCCESS) {
-                fprintf(stderr, "发布消息失败，返回代码 %d\n", rc);
+                Debug("MQTT: Failed to publish message, return code %d\n", rc);
             }
         }
         FreeBlock(b);
     }
 }
 
-bool InitMqttConnection(CONNECTION *c)
-{
-    char clientid[50];
-    snprintf(clientid, sizeof(clientid), "%s%d", CLIENTID_PRE, rand());
-    
-    return init_mqtt(c, clientid);
-}
-
+// 清理 MQTT 连接
 void CleanupMqttConnection(CONNECTION *c)
 {
-    if (c != NULL)
+    if (c != NULL && c->MQTTClient)
     {
-        if (c->MQTTClient)
-        {
-            MQTTClient_disconnect((MQTTClient)c->MQTTClient, 10000);
-            MQTTClient_destroy((MQTTClient*)&c->MQTTClient);
-            c->MQTTClient = NULL;
-        }
-
-        // 释放引用计数
-        if (c->ref != NULL)
-        {
-            Release(c->ref);  // 使用 Release 而不是 ReleaseRef
-            c->ref = NULL;
-        }
+        MQTTClient_disconnect((MQTTClient)c->MQTTClient, TIMEOUT);
+        MQTTClient_destroy((MQTTClient*)&c->MQTTClient);
+        c->MQTTClient = NULL;
     }
 }
 
-void run_mqtt_vpn(CONNECTION *c) {
-    if (!InitMqttConnection(c)) {
-        return;
-    }
-
-    while (!c->Halt) {
-        ProcessMqttMessages(c);
-        SendDataWithMQTT(c);
-        SleepThread(100);
-    }
-
-    CleanupMqttConnection(c);
-}
-void usage(void) {
-    fprintf(stderr, "Usage: mqtt_vpn -i <if_name> -b <mqtt_broker> [-n <client_id>] [-d]\n");
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <if_name>        Name of interface to use (mandatory)\n");
-    fprintf(stderr, "  -a <ip>             IP address of interface to use (mandatory)\n");
-    fprintf(stderr, "  -b <mqtt_broker>    MQTT broker address (e.g., tcp://localhost:1883)\n");
-    fprintf(stderr, "  -n <client_id>      MQTT client ID (optional)\n");
-    fprintf(stderr, "  -d                  Enable debug mode\n");
-    //exit(1);
-}
-// 添加一个函数来获取用户输入
-int get_mqtt_params(char **if_addr, char **ip_addr, char **broker, char **cl_id) {
-    char buffer[1024];  // 增大缓冲区以容纳完整命令行
-    char *token;
-    
-    // 显示 usage 信息
-    fprintf(stderr, "Usage: mqtt_vpn -i <tap_interface> -b <mqtt_broker> [-n <client_id>] [-d]\n");
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <tap_interface>  TAP interface name/address\n");
-    fprintf(stderr, "  -a <ip>             IP address of interface to use (mandatory)\n");
-    fprintf(stderr, "  -b <mqtt_broker>    MQTT broker address (e.g., tcp://localhost:1883)\n");
-    fprintf(stderr, "  -n <client_id>      MQTT client ID (optional)\n");
-    fprintf(stderr, "  -d                  Enable debug mode\n\n");
-    
-    printf("Enter command (e.g., -i mq0 -a 192.168.1.100 -b tcp://my_broker.org:1883 -d): ");
-    if (!fgets(buffer, sizeof(buffer), stdin)) {
-        return -1;
-    }
-    buffer[strcspn(buffer, "\n")] = 0;  // 移除换行符
-    
-    // 解析命令行参数
-    token = strtok(buffer, " ");
-    while (token) {
-        if (strcmp(token, "-i") == 0) {
-            token = strtok(NULL, " ");
-            if (token) {
-                *if_addr = _strdup(token);
-            }
-        } else if (strcmp(token, "-a") == 0) {
-            token = strtok(NULL, " ");
-            if (token) {
-                *ip_addr = _strdup(token);
-            }
-        } else if (strcmp(token, "-b") == 0) {
-            token = strtok(NULL, " ");
-            if (token) {
-                *broker = _strdup(token);
-            }
-        } else if (strcmp(token, "-n") == 0) {
-            token = strtok(NULL, " ");
-            if (token) {
-                *cl_id = _strdup(token);
-            }
-        }
-        token = strtok(NULL, " ");
-    }
-    
-    // 验证必要参数
-    if ((!*if_addr && !*ip_addr) || !*broker) {
-        fprintf(stderr, "Error: Either TAP interface or IP address, and MQTT broker address are required.\n");
-        return -1;
-    }
-    
-    return 0;
-}
-// 修改 mqtt_vpn_init 函数
-int mqtt_vpn_init(void) {
-    char *if_addr = NULL;
-    char *ip_addr = NULL;  // 新增 IP 地址参数
-    char *broker = NULL;
-    char *cl_id = NULL;
-    
-    // 获取用户输入的参数
-    if (get_mqtt_params(&if_addr, &ip_addr, &broker, &cl_id) != 0) {  // 修改函数签名
-        fprintf(stderr, "Failed to get MQTT parameters from user input\n");
-        return -1;
-    }
-    
-    // 构建参数数组
-    char *argv[9];  // 最多9个参数：程序名 + 8个选项 (-i, -a, -b, -n)
-    int argc = 0;
-    
-    argv[argc++] = "mqtt_vpn";
-    
-    // 添加接口名称参数
-    if (if_addr) {
-        argv[argc++] = "-i";
-        argv[argc++] = if_addr;
-    }
-    
-    // 添加 IP 地址参数
-    if (ip_addr) {
-        argv[argc++] = "-a";
-        argv[argc++] = ip_addr;
-    }
-    
-    // 添加 broker 参数
-    argv[argc++] = "-b";
-    argv[argc++] = broker;
-    
-    // 添加可选的客户端 ID
-    if (cl_id) {
-        argv[argc++] = "-n";
-        argv[argc++] = cl_id;
-    }
-    
-    // 调用 mqtt_vpn_start
-    int result = mqtt_vpn_start(argc, argv);
-    
-    // 清理分配的内存
-    free(if_addr);
-    free(ip_addr);  // 释放新增的内存
-    free(broker);
-    free(cl_id);
-    
-    return result;
-}
-
-HANDLE tun_alloc(const char *if_name, int flags, CEDAR *cedar) {
-    VH *v;
-    VH_OPTION vh_option;
-    CLIENT_OPTION client_option;
-    CLIENT_AUTH client_auth;
-    
-    // 不需要在这里创建 Cedar 实例，使用传入的参数
-    if (cedar == NULL) {
-        fprintf(stderr, "Error: Cedar instance is NULL\n");
-        return INVALID_HANDLE_VALUE;
-    }
-    
-    // 初始化选项
-    Zero(&vh_option, sizeof(vh_option));
-    Zero(&client_option, sizeof(client_option));
-    Zero(&client_auth, sizeof(client_auth));
-
-    // 设置虚拟主机选项
-    StrCpy(vh_option.HubName, sizeof(vh_option.HubName), if_name);
-    vh_option.UseNat = true;
-    
-    // 创建虚拟主机
-    v = NewVirtualHost(cedar, &client_option, &client_auth, &vh_option);
-    if (v == NULL) {
-        fprintf(stderr, "Error: Could not create virtual host\n");
-        return INVALID_HANDLE_VALUE;
-    }
-
-    // 初始化虚拟接口
-    if (!VirtualInit(v)) {
-        fprintf(stderr, "Error: Could not initialize virtual interface\n");
-        ReleaseVirtual(v);
-        return INVALID_HANDLE_VALUE;
-    }
-
-    printf("Successfully created virtual interface\n");
-    return (HANDLE)v;
-}
-
-
-int mqtt_vpn_start(int argc, char *argv[]) {
-    char *if_addr = NULL;
-    char *ip_addr = NULL;
-    char *broker = NULL;
-    char *cl_id = NULL;
-    int debug = 0;
-    TUN_HANDLE *tun = NULL;
-    ULONG NTEContext;
-    MQTTClient client;
-    CONNECTION *connection = NULL;
-    CEDAR *cedar = NULL;
-
-    // 初始化 Cedar
-    cedar = NewCedar(NULL, NULL);
-    if (cedar == NULL) {
-        fprintf(stderr, "Error: Could not create Cedar instance\n");
-        goto cleanup;
-    }
-
-    // 初始化 Winsock
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
-        return 1;
-    }
-
-    // 初始化 OpenSSL
-    SSL_library_init();
-    SSL_load_error_strings();
-
-    // 解析命令行参数
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
-            if_addr = argv[++i];
-        }
-        else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) {
-            ip_addr = argv[++i];
-        }
-        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
-            broker = argv[++i];
-        }
-        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-            cl_id = argv[++i];
-        }
-        else if (strcmp(argv[i], "-d") == 0) {
-            debug = 1;
-        }
-    }
-
-    // 验证必要参数
-    if ((!if_addr && !ip_addr) || !broker) {
-        usage();
-        goto cleanup;
-    }
-
-    // 打印调试信息
-    if (debug) {
-        fprintf(stderr, "Interface: %s\n", if_addr ? if_addr : "not set");
-        fprintf(stderr, "IP Address: %s\n", ip_addr ? ip_addr : "not set");
-        fprintf(stderr, "Broker: %s\n", broker);
-        fprintf(stderr, "Client ID: %s\n", cl_id ? cl_id : "not set");
-    }
-
-    // 创建 TAP 设备并使用指定的接口名称
-    tun = tun_alloc(if_addr, IFF_TAP | IFF_NO_PI, cedar);
-    if (tun == NULL) {
-        fprintf(stderr, "Error: Failed to create TAP interface '%s'\n", if_addr);
-        ReleaseCedar(cedar);  // 记得释放 Cedar
-        WSACleanup();
-        return 1;
-    }
-    printf("TAP interface '%s' created successfully\n", if_addr);
-
-    // 修正连接获取方式
-    LIST *connection_list = cedar->ConnectionList;
-    
-    // 获取新连接
-    if (connection_list != NULL)
-    {
-    connection = NewServerConnection(cedar, NULL, TCP_BOTH);
-    if (connection == NULL) {
-        fprintf(stderr, "Failed to create server connection\n");
-        goto cleanup;
-    }
-    
-    // 初始化引用计数
-    connection->ref = NewRef();  // 添加这行
-    if (connection->ref == NULL) {
-        fprintf(stderr, "Failed to create reference counter\n");
-        ReleaseConnection(connection);
-        goto cleanup;
-    }
-    
-    // 添加到连接列表
-    Add(connection_list, connection);
-    
-    // 初始化连接参数
-    StrCpy(connection->ServerName, sizeof(connection->ServerName), broker);
-    connection->MqttQoS = QOS;
-    StrCpy(connection->MqttTopic, sizeof(connection->MqttTopic), TOPIC_PRE);
-    connection->Socket = tun->tap_socket;
-    connection->Protocol = CONNECTION_TCP;
-    connection->Type = CONNECTION_TYPE_MQTT;
-    }
-    else
-    {
-        fprintf(stderr, "Connection list is NULL\n");
-        goto cleanup;
-    }
-
-    // 初始化 MQTT 连接
-    if (!InitMqttConnection(connection)) {
-        fprintf(stderr, "Failed to initialize MQTT connection\n");
-        goto cleanup;
-    }
-
-    // 运行主循环
-    run_mqtt_vpn(connection);
-
-cleanup:
-    // 清理资源
-    if (connection) {
-        CleanupMqttConnection(connection);
-        ReleaseConnection(connection);
-    }
-    if (tun) {
-        cleanup_tun(tun);
-    }
-    if (cedar) {
-        ReleaseCedar(cedar);  // 在清理时释放 Cedar
-    }
-    WSACleanup();
-    ERR_free_strings();
-
-    return 0;
-}
-// 添加 cleanup_tun 函数的实现
-void cleanup_tun(TUN_HANDLE* handle)
+// 创建 TAP 设备
+HANDLE CreateTapDevice(char *device_name)
 {
-    if (handle != NULL)
+    HANDLE handle;
+    char device_path[256];
+    
+    // 构造设备路径
+    snprintf(device_path, sizeof(device_path), 
+        "\\\\.\\Global\\%s.tap", device_name);
+
+    // 打开 TAP 设备
+    handle = CreateFileA(device_path, GENERIC_READ | GENERIC_WRITE,
+        0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED, 0);
+
+    if (handle == INVALID_HANDLE_VALUE)
     {
-        // 关闭 TAP 设备 socket
-        if (handle->tap_socket != INVALID_SOCKET)
-        {
-            closesocket(handle->tap_socket);
-            handle->tap_socket = INVALID_SOCKET;
-        }
-
-        // 释放 VH 句柄
-        if (handle->vh_handle != INVALID_HANDLE_VALUE)
-        {
-            VH *v = (VH *)handle->vh_handle;
-            // 停止虚拟主机
-            StopVirtualHost(v);
-            // 释放虚拟主机
-            ReleaseVirtual(v);
-            handle->vh_handle = INVALID_HANDLE_VALUE;
-        }
-
-        // 释放 Cedar 实例
-        if (handle->cedar != NULL)
-        {
-            ReleaseCedar(handle->cedar);
-            handle->cedar = NULL;
-        }
-
-        // 释放 TUN_HANDLE 结构体
-        Free(handle);
+        Debug("TAP: Failed to open device %s\n", device_path);
+        return INVALID_HANDLE_VALUE;
     }
+
+    // 设置 TAP 设备为启用状态
+    DWORD len;
+    ULONG status = 1;
+    if (!DeviceIoControl(handle, TAP_IOCTL_SET_MEDIA_STATUS,
+        &status, sizeof(status), &status, sizeof(status), &len, NULL))
+    {
+        Debug("TAP: Failed to set media status\n");
+        CloseHandle(handle);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    Debug("TAP: Device %s opened successfully\n", device_path);
+    return handle;
+}
+
+// 配置 TAP 设备 IP 地址
+bool ConfigureTapDevice(const char *device_name, const char *ip_address)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), 
+        "netsh interface ip set address \"%s\" static %s 255.255.255.0",
+        device_name, ip_address);
+    
+    return (system(cmd) == 0);
+}
+
+// 获取用户输入的 MQTT 配置
+bool GetMqttUserConfig()
+{
+    char buffer[256];
+    
+    printf("Enter MQTT broker address (e.g., tcp://localhost:1883): ");
+    if (!fgets(buffer, sizeof(buffer), stdin)) return false;
+    buffer[strcspn(buffer, "\n")] = 0;
+    StrCpy(g_mqtt_config.broker, sizeof(g_mqtt_config.broker), buffer);
+
+    printf("Enter MQTT topic (default: mqttip): ");
+    if (!fgets(buffer, sizeof(buffer), stdin)) return false;
+    buffer[strcspn(buffer, "\n")] = 0;
+    if (strlen(buffer) > 0) {
+        StrCpy(g_mqtt_config.topic, sizeof(g_mqtt_config.topic), buffer);
+    } else {
+        StrCpy(g_mqtt_config.topic, sizeof(g_mqtt_config.topic), TOPIC_PRE);
+    }
+
+    printf("Enter MQTT QoS (0-2, default: 0): ");
+    if (!fgets(buffer, sizeof(buffer), stdin)) return false;
+    g_mqtt_config.qos = atoi(buffer);
+    if (g_mqtt_config.qos < 0 || g_mqtt_config.qos > 2) {
+        g_mqtt_config.qos = QOS;
+    }
+
+    return true;
+}
+
+// 获取当前 MQTT 配置
+const MQTT_CONFIG* GetCurrentMqttConfig()
+{
+    return &g_mqtt_config;
 }
