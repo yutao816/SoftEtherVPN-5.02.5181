@@ -26,6 +26,6149 @@
 #include "NullLan.h"
 #endif
 
+#include "MQTTClient.h"
+
+#define ADDRESS     "tcp://localhost:1883"
+#define CLIENTID    "SoftEtherVPN_Client"
+#define QOS         1
+#define TIMEOUT     10000L
+
+#include "Mayaqua/Cfg.h"
+#include "Mayaqua/Encrypt.h"
+#include "Mayaqua/FileIO.h"
+#include "Mayaqua/Internat.h"
+#include "Mayaqua/Kernel.h"
+#include "Mayaqua/MayaType.h"
+#include "Mayaqua/Memory.h"
+#include "Mayaqua/Microsoft.h"
+#include "Mayaqua/Network.h"
+#include "Mayaqua/Object.h"
+#include "Mayaqua/OS.h"
+#include "Mayaqua/Pack.h"
+#include "Mayaqua/Secure.h"
+#include "Mayaqua/Str.h"
+#include "Mayaqua/Table.h"
+#include "Mayaqua/Tick64.h"
+#include "Mayaqua/Win32.h"
+
+#include <stdlib.h>
+
+static CLIENT *client = NULL;
+static LISTENER *cn_listener = NULL;
+static LOCK *cn_listener_lock = NULL;
+static UINT64 cn_next_allow = 0;
+static LOCK *ci_active_sessions_lock = NULL;
+static UINT ci_num_active_sessions = 0;
+
+typedef struct PACK
+{
+    void *Buf;
+    UINT Size;
+    // 其他成员...
+} PACK;
+// 在Windows中 8或稍后，更改不合理的WCM设置，以确保VPN正常运行
+void CiDisableWcmNetworkMinimize(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	// 验证参数
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (c->Config.NoChangeWcmNetworkSettingOnWindows8)
+	{
+		return;
+	}
+
+	MsDisableWcmNetworkMinimize();
+#endif	// OS_WIN32
+}
+
+// 按上次连接日期比较RPC_CLIENT_ENUM_ACCOUNT_ITEM项目（反向）
+int CiCompareClientAccountEnumItemByLastConnectDateTime(void *p1, void *p2)
+{
+	RPC_CLIENT_ENUM_ACCOUNT_ITEM *a1, *a2;
+	if (p1 == NULL || p2 == NULL)
+	{
+		return 0;
+	}
+	a1 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p1;
+	a2 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p2;
+	if (a1 == NULL || a2 == NULL)
+	{
+		return 0;
+	}
+	if (a1->LastConnectDateTime > a2->LastConnectDateTime)
+	{
+		return -1;
+	}
+	else if (a1->LastConnectDateTime < a2->LastConnectDateTime)
+	{
+		return 1;
+	}
+
+	return 0;
+}
+
+// 如果机器发生更改，请重新排列所有虚拟NIC的MAC地址
+void CiChangeAllVLanMacAddressIfMachineChanged(CLIENT *c)
+{
+	UCHAR current_hash_new[SHA1_SIZE];
+	UCHAR current_hash[SHA1_SIZE];
+	UCHAR current_hash_old[SHA1_SIZE];
+	UCHAR saved_hash[SHA1_SIZE];
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+#ifdef OS_WIN32
+	if (MsIsAdmin() == false)
+	{
+		return;
+	}
+#endif
+
+	CiGetCurrentMachineHashNew(current_hash_new);
+	CiGetCurrentMachineHash(current_hash);
+	CiGetCurrentMachineHashOld(current_hash_old);
+
+	if (CiReadLastMachineHash(saved_hash) == false)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_old, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_new, SHA1_SIZE) == 0)
+	{
+		return;
+	}
+
+	if (CiWriteLastMachineHash(current_hash_new) == false)
+	{
+		return;
+	}
+
+	CiChangeAllVLanMacAddress(c);
+}
+
+// 获取当前计算机哈希值（旧）
+void CiGetCurrentMachineHashOld(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	// Product ID
+	product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductId");
+	if (product_id == NULL)
+	{
+		product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", "ProductId");
+	}
+
+	StrCpy(name, sizeof(name), product_id);
+
+	Free(product_id);
+
+#else	// OS_WIN32
+	GetMachineName(name, sizeof(name));
+#endif	// OS_WIN32
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// Get current machine hash
+void CiGetCurrentMachineHash(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// 获取当前计算机哈希值（不使用域名）
+void CiGetCurrentMachineHashNew(void *data)
+{
+	char name[MAX_PATH];
+	char *p;
+
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	// Ignore after first period(.)
+	for(p=name; *p; p++)
+		if(*p == '.')
+			*p = 0;
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+
+// 写入机器哈希
+bool CiWriteLastMachineHash(void *data)
+{
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	if (MsRegWriteBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", data, SHA1_SIZE, true) == false)
+	{
+		return false;
+	}
+
+	return true;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// Get previous machine hash
+bool CiReadLastMachineHash(void *data)
+{
+	BUF *b = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	b = MsRegReadBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", true);
+	if (b == NULL)
+	{
+		return false;
+	}
+	if (b->Size == SHA1_SIZE)
+	{
+		Copy(data, b->Buf, b->Size);
+		FreeBuf(b);
+
+		return true;
+	}
+
+	FreeBuf(b);
+	return false;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// 如果每个虚拟LAN卡的MAC地址已被删除，请将其设置为随机数
+// (measures for Windows 8 -> 8.1 upgrade problem)
+void CiChangeAllVLanMacAddressIfCleared(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (MsIsInfCatalogRequired() == false)
+	{
+		// Not required for other than Windows 8
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress))
+			{
+				if (mac[0] == 0x00 &&
+					mac[1] == 0x00 &&
+					mac[2] == 0x01 &&
+					mac[3] == 0x00 &&
+					mac[4] == 0x00 &&
+					mac[5] == 0x01)
+				{
+					char *name = e->DeviceName;
+					RPC_CLIENT_SET_VLAN s;
+					UCHAR mac[6];
+
+					GenMacAddress(mac);
+
+					Zero(&s, sizeof(s));
+					StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+					MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+					CtSetVLan(c, &s);
+				}
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+#endif	// OS_WIN32
+}
+
+// 将所有虚拟LAN卡的MAC地址设置为随机数
+void CiChangeAllVLanMacAddress(CLIENT *c)
+{
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress) && ((mac[0] == 0x00 && mac[1] == 0xAC) || (mac[0] == 0x5E)))
+			{
+				char *name = e->DeviceName;
+				RPC_CLIENT_SET_VLAN s;
+				UCHAR mac[6];
+
+				GenMacAddress(mac);
+
+				Zero(&s, sizeof(s));
+				StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+				MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+				CtSetVLan(c, &s);
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+}
+
+// Wait for preparation of notification service to complete
+void CnWaitForCnServiceReady()
+{
+	UINT64 start_time = Tick64();
+
+	while ((start_time + (UINT64)CLIENT_WAIT_CN_READY_TIMEOUT) >= Tick64())
+	{
+		if (CnIsCnServiceReady())
+		{
+			break;
+		}
+
+		SleepThread(100);
+	}
+}
+
+// Check whether preparation of notification service completed
+bool CnIsCnServiceReady()
+{
+	SOCK *s;
+	// Confirm running the notification service
+	if (CnCheckAlreadyExists(false) == false)
+	{
+		// Not running
+		return false;
+	}
+
+	// Try to connect to the TCP port
+	s = ConnectEx("localhost", CLIENT_NOTIFY_PORT, 500);
+	if (s == NULL)
+	{
+		// The TCP port is not opened
+		return false;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	// Running
+	return true;
+}
+
+// Check whether the notification service is already running
+bool CnCheckAlreadyExists(bool lock)
+{
+#ifdef	OS_WIN32
+	return Win32CnCheckAlreadyExists(lock);
+#else
+	return false;
+#endif
+}
+
+typedef struct CNC_STATUS_PRINTER_WINDOW_PARAM
+{
+	THREAD *Thread;
+	SESSION *Session;
+	SOCK *Sock;
+} CNC_STATUS_PRINTER_WINDOW_PARAM;
+
+typedef struct CNC_CONNECT_ERROR_DLG_THREAD_PARAM
+{
+	SESSION *Session;
+	SOCK *Sock;
+	bool HaltThread;
+	EVENT *Event;
+} CNC_CONNECT_ERROR_DLG_THREAD_PARAM;
+
+// Thread to stop forcibly the Certificate check dialog client
+void CncCheckCertHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the certification check dialog
+void CncCheckCert(SESSION *session, UI_CHECKCERT *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "check_cert");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddX(p, "x", dlg->x);
+	PackAddX(p, "parent_x", dlg->parent_x);
+	PackAddX(p, "old_x", dlg->old_x);
+	PackAddBool(p, "DiffWarning", dlg->DiffWarning);
+	PackAddBool(p, "Ok", dlg->Ok);
+	PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Sock = s;
+	dp->Event = NewEvent();
+	dp->Session = session;
+
+	t = NewThread(CncCheckCertHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		dlg->Ok = PackGetBool(p, "Ok");
+		dlg->DiffWarning = PackGetBool(p, "DiffWarning");
+		dlg->SaveServerCert = PackGetBool(p, "SaveServerCert");
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Smart card signature dialog
+bool CncSecureSignDlg(SECURE_SIGN *sign)
+{
+	SOCK *s;
+	PACK *p;
+	bool ret = false;
+	// Validate arguments
+	if (sign == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return false;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "secure_sign");
+	OutRpcSecureSign(p, sign);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ret");
+
+		if (ret)
+		{
+			FreeRpcSecureSign(sign);
+
+			Zero(sign, sizeof(SECURE_SIGN));
+			InRpcSecureSign(sign, p);
+		}
+
+		FreePack(p);
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Show the NIC information dialog
+SOCK *CncNicInfo(UI_NICINFO *info)
+{
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (info == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "nicinfo");
+	PackAddStr(p, "NicName", info->NicName);
+	PackAddUniStr(p, "AccountName", info->AccountName);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the NIC information dialog
+void CncNicInfoFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the message dialog
+SOCK *CncMsgDlg(UI_MSG_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	char *utf;
+	// Validate arguments
+	if (dlg == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "msg_dialog");
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddStr(p, "HubName", dlg->HubName);
+	utf = CopyUniToUtf(dlg->Msg);
+	PackAddData(p, "Msg", utf, StrLen(utf));
+	Free(utf);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the message dialog
+void CndMsgDlgFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the password input dialog
+bool CncPasswordDlg(SESSION *session, UI_PASSWORD_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	bool ret = false;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		Wait(session->HaltEvent, session->RetryInterval);
+		return true;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "password_dialog");
+	PackAddInt(p, "Type", dlg->Type);
+	PackAddStr(p, "Username", dlg->Username);
+	PackAddStr(p, "Password", dlg->Password);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+	PackAddBool(p, "AdminMode", dlg->AdminMode);
+	PackAddBool(p, "ShowNoSavePassword", dlg->ShowNoSavePassword);
+	PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Session = session;
+	dp->Sock = s;
+	dp->Event = NewEvent();
+
+	t = NewThread(CncConnectErrorDlgHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ok");
+		dlg->NoSavePassword = PackGetBool(p, "NoSavePassword");
+		dlg->ProxyServer = PackGetBool(p, "ProxyServer");
+		dlg->Type = PackGetInt(p, "Type");
+		PackGetStr(p, "Username", dlg->Username, sizeof(dlg->Username));
+		PackGetStr(p, "Password", dlg->Password, sizeof(dlg->Password));
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Thread to stop the connection error dialog client forcibly
+void CncConnectErrorDlgHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the connection error dialog
+bool CncConnectErrorDlg(SESSION *session, UI_CONNECTERROR_DLG *dlg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/connect_error/%s", dlg->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "connecterror_dialog");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "Err", dlg->Err);
+	PackAddInt(p, "CurrentRetryCount", dlg->CurrentRetryCount);
+	PackAddInt(p, "RetryLimit", dlg->RetryLimit);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	p = RecvPack(mqtt_client);
+	if (p != NULL)
+	{
+		dlg->HideWindow = PackGetBool(p, "HideWindow");
+
+		FreePack(p);
+	}
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return true;
+}
+
+// Thread for the status indicator client
+void CncStatusPrinterWindowThreadProc(THREAD *thread, void *param)
+{
+	CNC_STATUS_PRINTER_WINDOW_PARAM *pp;
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", pp->Session->Account->ClientOption->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	StopSessionEx(pp->Session, true);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Create a status indicator client
+SOCK *CncStatusPrinterWindowStart(SESSION *s)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", s->Account->ClientOption->AccountName);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "status_printer");
+	PackAddUniStr(p, "account_name", s->Account->ClientOption->AccountName);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	CNC_STATUS_PRINTER_WINDOW_PARAM *param = ZeroMalloc(sizeof(CNC_STATUS_PRINTER_WINDOW_PARAM));
+	param->Session = s;
+
+	THREAD *t = NewThread(CncStatusPrinterWindowThreadProc, param);
+	WaitThreadInit(t);
+
+	ReleaseThread(t);
+
+	return (SOCK *)mqtt_client;
+}
+
+// Send a string to the status indicator
+void CncStatusPrinterWindowPrint(SOCK *s, wchar_t *str)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", str);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = str;
+	pubmsg.payloadlen = wcslen(str) * sizeof(wchar_t);
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+}
+
+// Stop the status indicator client
+void CncStatusPrinterWindowStop(SOCK *s)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Start the driver installer for Windows Vista
+bool CncExecDriverInstaller(char *arg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exec_driver_installer");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exec_driver_installer");
+	PackAddStr(p, "arg", arg);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	bool ret = *(bool *)msg_payload;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return ret;
+}
+
+// Let the current running client notification services releasing the socket
+void CncReleaseSocket()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/release_socket");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "release_socket");
+
+#ifdef OS_WIN32
+	PackAddInt(p, "pid", MsGetProcessId());
+#endif	// OS_WIN32
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Terminate the process of the client notification service
+void CncExit()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exit");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exit");
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+#ifdef	OS_WIN32
+	MsKillOtherInstanceEx("vpnclient");
+#endif	// OS_WIN32
+}
+
+// Connect to the client notification service
+SOCK *CncConnect()
+{
+    return CncConnectEx(0);
+}
+SOCK *CncConnectEx(UINT timeout)
+{
+    MQTTClient mqtt_client;
+    MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+    MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    MQTTClient_connect(mqtt_client, &conn_opts);
+
+    return (SOCK *)mqtt_client;
+}
+// SOCK *CncConnect()
+// {
+// 	return CncConnectEx(0);
+// }
+// SOCK *CncConnectEx(UINT timeout)
+// {
+// 	MQTTClient mqtt_client;
+// 	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+// 	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+// 	MQTTClient_connect(mqtt_client, &conn_opts);
+
+// 	return (SOCK *)mqtt_client;
+// }
+
+#ifdef	OS_WIN32
+
+// Thread for the certificate check dialog
+void Win32CnCheckCertThreadProc(THREAD *thread, void *param)
+{
+	UI_CHECKCERT *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CHECKCERT *)param;
+
+	CheckCertDlg(dlg);
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "Ok", dlg->Ok);
+		PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Certificate check dialog
+void Win32CnCheckCert(SOCK *s, PACK *p)
+{
+	UI_CHECKCERT dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.x = PackGetX(p, "x");
+	dlg.parent_x = PackGetX(p, "parent_x");
+	dlg.old_x = PackGetX(p, "old_x");
+	dlg.DiffWarning = PackGetBool(p, "DiffWarning");
+	dlg.Ok = PackGetBool(p, "Ok");
+	dlg.SaveServerCert = PackGetBool(p, "SaveServerCert");
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnCheckCertThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	FreeX(dlg.parent_x);
+	FreeX(dlg.old_x);
+	FreeX(dlg.x);
+}
+
+// Message display dialog thread procedure
+void Win32CnMsgDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_MSG_DLG *dlg = (UI_MSG_DLG *)param;
+	wchar_t tmp[MAX_SIZE];
+	char url[MAX_SIZE];
+	// Validate arguments
+	if (thread == NULL || dlg == NULL)
+	{
+		return;
+	}
+
+	UniFormat(tmp, sizeof(tmp), _UU("CM_MSG_TITLE"),
+		dlg->ServerName, dlg->HubName);
+
+	if (IsURLMsg(dlg->Msg, url, sizeof(url)) == false)
+	{
+		OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+	}
+	else
+	{
+		if (MsExecute(url, NULL) == false)
+		{
+			OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+		}
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// NIC information dialog thread procedure
+void Win32CnNicInfoThreadProc(THREAD *thread, void *param)
+{
+	UI_NICINFO *info = (UI_NICINFO *)param;
+	// Validate arguments
+	if (thread == NULL || info == NULL)
+	{
+		return;
+	}
+
+	NicInfo(info);
+
+	Disconnect(info->Sock);
+}
+
+// NIC information dialog
+void Win32CnNicInfo(SOCK *s, PACK *p)
+{
+	UI_NICINFO info;
+	THREAD *t;
+	Zero(&info, sizeof(info));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "NicName", info.NicName, sizeof(info.NicName));
+	PackGetUniStr(p, "AccountName", info.AccountName, sizeof(info.AccountName));
+
+	info.Sock = s;
+
+	t = NewThread(Win32CnNicInfoThreadProc, &info);
+
+	FreePack(RecvPack(s));
+
+	info.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+}
+
+// Message display dialog
+void Win32CnMsgDlg(SOCK *s, PACK *p)
+{
+	UI_MSG_DLG dlg;
+	THREAD *t;
+	UINT utf_size;
+	char *utf;
+	wchar_t *msg;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	PackGetStr(p, "HubName", dlg.HubName, sizeof(dlg.HubName));
+
+	utf_size = PackGetDataSize(p, "Msg");
+	utf = ZeroMalloc(utf_size + 8);
+
+	PackGetData(p, "Msg", utf);
+
+	msg = CopyUtfToUni(utf);
+	Free(utf);
+
+	dlg.Sock = s;
+	dlg.Msg = msg;
+
+	t = NewThread(Win32CnMsgDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	Free(msg);
+}
+
+// Thread for Password input dialog
+void Win32CnPasswordDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_PASSWORD_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_PASSWORD_DLG *)param;
+
+	if (PasswordDlg(NULL, dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddStr(p, "Username", dlg->Username);
+		PackAddStr(p, "Password", dlg->Password);
+		PackAddInt(p, "Type", dlg->Type);
+		PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+		PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Password input dialog
+void Win32CnPasswordDlg(SOCK *s, PACK *p)
+{
+	UI_PASSWORD_DLG dlg;
+	THREAD *t = NULL;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	dlg.Type = PackGetInt(p, "Type");
+	PackGetStr(p, "Username", dlg.Username, sizeof(dlg.Username));
+	PackGetStr(p, "Password", dlg.Password, sizeof(dlg.Password));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.ProxyServer = PackGetBool(p, "ProxyServer");
+	dlg.AdminMode = PackGetBool(p, "AdminMode");
+	dlg.ShowNoSavePassword = PackGetBool(p, "ShowNoSavePassword");
+	dlg.NoSavePassword = PackGetBool(p, "NoSavePassword");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnPasswordDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Thread for the connection error dialog
+void Win32CnConnectErrorDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_CONNECTERROR_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CONNECTERROR_DLG *)param;
+
+	if (ConnectErrorDlg(dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Connection Error dialog (Win32)
+void Win32CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	UI_CONNECTERROR_DLG dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.Err = PackGetInt(p, "Err");
+	dlg.CurrentRetryCount = PackGetInt(p, "CurrentRetryCount");
+	dlg.RetryLimit = PackGetInt(p, "RetryLimit");
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.HideWindow = PackGetBool(p, "HideWindow");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnConnectErrorDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Status indicator (Win32)
+void Win32CnStatusPrinter(SOCK *s, PACK *p)
+{
+	STATUS_WINDOW *w;
+	wchar_t account_name[MAX_ACCOUNT_NAME_LEN + 1];
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "account_name", account_name, sizeof(account_name));
+
+	w = StatusPrinterWindowStart(s, account_name);
+
+	while (true)
+	{
+		PACK *p = RecvPack(s);
+
+		if (p == NULL)
+		{
+			// Exit the dialog because it is disconnected
+			break;
+		}
+		else
+		{
+			wchar_t tmp[MAX_SIZE];
+
+			// Rewrite the string
+			PackGetUniStr(p, "string", tmp, sizeof(tmp));
+
+			StatusPrinterWindowPrint(w, tmp);
+
+			FreePack(p);
+		}
+	}
+
+	StatusPrinterWindowStop(w);
+}
+
+// Start the driver installer (for Windows Vista)
+void Win32CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	char arg[MAX_SIZE];
+	bool ret;
+	void *helper = NULL;
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	if (PackGetStr(p, "arg", arg, sizeof(arg)) == false)
+	{
+		return;
+	}
+
+	helper = CmStartUacHelper();
+
+	ret = MsExecDriverInstaller(arg);
+
+	CmStopUacHelper(helper);
+
+	p = NewPack();
+	PackAddBool(p, "ret", ret);
+	SendPack(s, p);
+
+	FreePack(p);
+}
+
+#endif	// OS_WIN32
+
+// Start the driver installer
+void CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnExecDriverInstaller(s, p);
+#endif	// OS_WIN32
+}
+
+// Certificate confirmation dialog
+void CnCheckCert(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnCheckCert(s, p);
+#endif	// OS_WIN32
+}
+
+// NIC information dialog
+void CnNicInfo(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnNicInfo(s, p);
+#endif	// OS_WIN32
+}
+
+// Message display dialog
+void CnMsgDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnMsgDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Password input dialog
+void CnPasswordDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnPasswordDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Connection Error dialog
+void CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnConnectErrorDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Status indicator
+void CnStatusPrinter(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnStatusPrinter(s, p);
+#endif	// OS_WIN32
+}
+// Client notification service listener thread
+void CnListenerProc(THREAD *thread, void *param)
+{
+	TCP_ACCEPTED_PARAM *data = (TCP_ACCEPTED_PARAM *)param;
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (data == NULL || thread == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	//Set Application ID
+	JL_SetCurrentProcessExplicitAppUserModelID(APPID_CM);
+#endif	// OS_WIN32
+}
+// SoftEther VPN Source Code - Developer Edition Master Branch
+// Cedar Communication Module
+// © 2020 Nokia
+
+// Client.c
+// Client Manager
+
+#include "Client.h"
+
+#include "Account.h"
+#include "Admin.h"
+#include "Cedar.h"
+#include "CM.h"
+#include "Connection.h"
+#include "IPC.h"
+#include "Listener.h"
+#include "Logging.h"
+#include "Protocol.h"
+#include "Remote.h"
+#include "Virtual.h"
+#include "VLanUnix.h"
+#include "VLanWin32.h"
+#include "Win32Com.h"
+#include "WinUi.h"
+#ifdef	NO_VLAN
+#include "NullLan.h"
+#endif
+
+#include "Mayaqua/Cfg.h"
+#include "Mayaqua/Encrypt.h"
+#include "Mayaqua/FileIO.h"
+#include "Mayaqua/Internat.h"
+#include "Mayaqua/Kernel.h"
+#include "Mayaqua/MayaType.h"
+#include "Mayaqua/Memory.h"
+#include "Mayaqua/Microsoft.h"
+#include "Mayaqua/Network.h"
+#include "Mayaqua/Object.h"
+#include "Mayaqua/OS.h"
+#include "Mayaqua/Pack.h"
+#include "Mayaqua/Secure.h"
+#include "Mayaqua/Str.h"
+#include "Mayaqua/Table.h"
+#include "Mayaqua/Tick64.h"
+#include "Mayaqua/Win32.h"
+
+#include <stdlib.h>
+
+static CLIENT *client = NULL;
+static LISTENER *cn_listener = NULL;
+static LOCK *cn_listener_lock = NULL;
+static UINT64 cn_next_allow = 0;
+static LOCK *ci_active_sessions_lock = NULL;
+static UINT ci_num_active_sessions = 0;
+// SoftEther VPN Source Code - Developer Edition Master Branch
+// Cedar Communication Module
+// © 2020 Nokia
+
+// Client.c
+// Client Manager
+
+#include "Client.h"
+#include "MQTTClient.h"
+#include "Account.h"
+#include "Admin.h"
+#include "Cedar.h"
+#include "CM.h"
+#include "Connection.h"
+#include "IPC.h"
+#include "Listener.h"
+#include "Logging.h"
+#include "Protocol.h"
+#include "Remote.h"
+#include "Virtual.h"
+#include "VLanUnix.h"
+#include "VLanWin32.h"
+#include "Win32Com.h"
+#include "WinUi.h"
+#ifdef	NO_VLAN
+#include "NullLan.h"
+#endif
+
+#include "Mayaqua/Cfg.h"
+#include "Mayaqua/Encrypt.h"
+#include "Mayaqua/FileIO.h"
+#include "Mayaqua/Internat.h"
+#include "Mayaqua/Kernel.h"
+#include "Mayaqua/MayaType.h"
+#include "Mayaqua/Memory.h"
+#include "Mayaqua/Microsoft.h"
+#include "Mayaqua/Network.h"
+#include "Mayaqua/Object.h"
+#include "Mayaqua/OS.h"
+#include "Mayaqua/Pack.h"
+#include "Mayaqua/Secure.h"
+#include "Mayaqua/Str.h"
+#include "Mayaqua/Table.h"
+#include "Mayaqua/Tick64.h"
+#include "Mayaqua/Win32.h"
+
+#include <stdlib.h>
+
+static CLIENT *client = NULL;
+static LISTENER *cn_listener = NULL;
+static LOCK *cn_listener_lock = NULL;
+static UINT64 cn_next_allow = 0;
+static LOCK *ci_active_sessions_lock = NULL;
+static UINT ci_num_active_sessions = 0;
+
+
+// 在Windows中 8或稍后，更改不合理的WCM设置，以确保VPN正常运行
+void CiDisableWcmNetworkMinimize(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	// 验证参数
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (c->Config.NoChangeWcmNetworkSettingOnWindows8)
+	{
+		return;
+	}
+
+	MsDisableWcmNetworkMinimize();
+#endif	// OS_WIN32
+}
+
+// 按上次连接日期比较RPC_CLIENT_ENUM_ACCOUNT_ITEM项目（反向）
+int CiCompareClientAccountEnumItemByLastConnectDateTime(void *p1, void *p2)
+{
+	RPC_CLIENT_ENUM_ACCOUNT_ITEM *a1, *a2;
+	if (p1 == NULL || p2 == NULL)
+	{
+		return 0;
+	}
+	a1 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p1;
+	a2 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p2;
+	if (a1 == NULL || a2 == NULL)
+	{
+		return 0;
+	}
+	if (a1->LastConnectDateTime > a2->LastConnectDateTime)
+	{
+		return -1;
+	}
+	else if (a1->LastConnectDateTime < a2->LastConnectDateTime)
+	{
+		return 1;
+	}
+
+	return 0;
+}
+
+// 如果机器发生更改，请重新排列所有虚拟NIC的MAC地址
+void CiChangeAllVLanMacAddressIfMachineChanged(CLIENT *c)
+{
+	UCHAR current_hash_new[SHA1_SIZE];
+	UCHAR current_hash[SHA1_SIZE];
+	UCHAR current_hash_old[SHA1_SIZE];
+	UCHAR saved_hash[SHA1_SIZE];
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+#ifdef OS_WIN32
+	if (MsIsAdmin() == false)
+	{
+		return;
+	}
+#endif
+
+	CiGetCurrentMachineHashNew(current_hash_new);
+	CiGetCurrentMachineHash(current_hash);
+	CiGetCurrentMachineHashOld(current_hash_old);
+
+	if (CiReadLastMachineHash(saved_hash) == false)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_old, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_new, SHA1_SIZE) == 0)
+	{
+		return;
+	}
+
+	if (CiWriteLastMachineHash(current_hash_new) == false)
+	{
+		return;
+	}
+
+	CiChangeAllVLanMacAddress(c);
+}
+
+// 获取当前计算机哈希值（旧）
+void CiGetCurrentMachineHashOld(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	// Product ID
+	product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductId");
+	if (product_id == NULL)
+	{
+		product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", "ProductId");
+	}
+
+	StrCpy(name, sizeof(name), product_id);
+
+	Free(product_id);
+
+#else	// OS_WIN32
+	GetMachineName(name, sizeof(name));
+#endif	// OS_WIN32
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// Get current machine hash
+void CiGetCurrentMachineHash(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// 获取当前计算机哈希值（不使用域名）
+void CiGetCurrentMachineHashNew(void *data)
+{
+	char name[MAX_PATH];
+	char *p;
+
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	// Ignore after first period(.)
+	for(p=name; *p; p++)
+		if(*p == '.')
+			*p = 0;
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+
+// 写入机器哈希
+bool CiWriteLastMachineHash(void *data)
+{
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	if (MsRegWriteBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", data, SHA1_SIZE, true) == false)
+	{
+		return false;
+	}
+
+	return true;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// Get previous machine hash
+bool CiReadLastMachineHash(void *data)
+{
+	BUF *b = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	b = MsRegReadBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", true);
+	if (b == NULL)
+	{
+		return false;
+	}
+	if (b->Size == SHA1_SIZE)
+	{
+		Copy(data, b->Buf, b->Size);
+		FreeBuf(b);
+
+		return true;
+	}
+
+	FreeBuf(b);
+	return false;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// 如果每个虚拟LAN卡的MAC地址已被删除，请将其设置为随机数
+// (measures for Windows 8 -> 8.1 upgrade problem)
+void CiChangeAllVLanMacAddressIfCleared(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (MsIsInfCatalogRequired() == false)
+	{
+		// Not required for other than Windows 8
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress))
+			{
+				if (mac[0] == 0x00 &&
+					mac[1] == 0x00 &&
+					mac[2] == 0x01 &&
+					mac[3] == 0x00 &&
+					mac[4] == 0x00 &&
+					mac[5] == 0x01)
+				{
+					char *name = e->DeviceName;
+					RPC_CLIENT_SET_VLAN s;
+					UCHAR mac[6];
+
+					GenMacAddress(mac);
+
+					Zero(&s, sizeof(s));
+					StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+					MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+					CtSetVLan(c, &s);
+				}
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+#endif	// OS_WIN32
+}
+
+// 将所有虚拟LAN卡的MAC地址设置为随机数
+void CiChangeAllVLanMacAddress(CLIENT *c)
+{
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress) && ((mac[0] == 0x00 && mac[1] == 0xAC) || (mac[0] == 0x5E)))
+			{
+				char *name = e->DeviceName;
+				RPC_CLIENT_SET_VLAN s;
+				UCHAR mac[6];
+
+				GenMacAddress(mac);
+
+				Zero(&s, sizeof(s));
+				StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+				MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+				CtSetVLan(c, &s);
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+}
+
+// Wait for preparation of notification service to complete
+void CnWaitForCnServiceReady()
+{
+	UINT64 start_time = Tick64();
+
+	while ((start_time + (UINT64)CLIENT_WAIT_CN_READY_TIMEOUT) >= Tick64())
+	{
+		if (CnIsCnServiceReady())
+		{
+			break;
+		}
+
+		SleepThread(100);
+	}
+}
+
+// Check whether preparation of notification service completed
+bool CnIsCnServiceReady()
+{
+	SOCK *s;
+	// Confirm running the notification service
+	if (CnCheckAlreadyExists(false) == false)
+	{
+		// Not running
+		return false;
+	}
+
+	// Try to connect to the TCP port
+	s = ConnectEx("localhost", CLIENT_NOTIFY_PORT, 500);
+	if (s == NULL)
+	{
+		// The TCP port is not opened
+		return false;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	// Running
+	return true;
+}
+
+// Check whether the notification service is already running
+bool CnCheckAlreadyExists(bool lock)
+{
+#ifdef	OS_WIN32
+	return Win32CnCheckAlreadyExists(lock);
+#else
+	return false;
+#endif
+}
+
+typedef struct CNC_STATUS_PRINTER_WINDOW_PARAM
+{
+	THREAD *Thread;
+	SESSION *Session;
+	SOCK *Sock;
+} CNC_STATUS_PRINTER_WINDOW_PARAM;
+
+typedef struct CNC_CONNECT_ERROR_DLG_THREAD_PARAM
+{
+	SESSION *Session;
+	SOCK *Sock;
+	bool HaltThread;
+	EVENT *Event;
+} CNC_CONNECT_ERROR_DLG_THREAD_PARAM;
+
+// Thread to stop forcibly the Certificate check dialog client
+void CncCheckCertHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the certification check dialog
+void CncCheckCert(SESSION *session, UI_CHECKCERT *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "check_cert");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddX(p, "x", dlg->x);
+	PackAddX(p, "parent_x", dlg->parent_x);
+	PackAddX(p, "old_x", dlg->old_x);
+	PackAddBool(p, "DiffWarning", dlg->DiffWarning);
+	PackAddBool(p, "Ok", dlg->Ok);
+	PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Sock = s;
+	dp->Event = NewEvent();
+	dp->Session = session;
+
+	t = NewThread(CncCheckCertHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		dlg->Ok = PackGetBool(p, "Ok");
+		dlg->DiffWarning = PackGetBool(p, "DiffWarning");
+		dlg->SaveServerCert = PackGetBool(p, "SaveServerCert");
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Smart card signature dialog
+bool CncSecureSignDlg(SECURE_SIGN *sign)
+{
+	SOCK *s;
+	PACK *p;
+	bool ret = false;
+	// Validate arguments
+	if (sign == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return false;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "secure_sign");
+	OutRpcSecureSign(p, sign);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ret");
+
+		if (ret)
+		{
+			FreeRpcSecureSign(sign);
+
+			Zero(sign, sizeof(SECURE_SIGN));
+			InRpcSecureSign(sign, p);
+		}
+
+		FreePack(p);
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Show the NIC information dialog
+SOCK *CncNicInfo(UI_NICINFO *info)
+{
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (info == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "nicinfo");
+	PackAddStr(p, "NicName", info->NicName);
+	PackAddUniStr(p, "AccountName", info->AccountName);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the NIC information dialog
+void CncNicInfoFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the message dialog
+SOCK *CncMsgDlg(UI_MSG_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	char *utf;
+	// Validate arguments
+	if (dlg == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "msg_dialog");
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddStr(p, "HubName", dlg->HubName);
+	utf = CopyUniToUtf(dlg->Msg);
+	PackAddData(p, "Msg", utf, StrLen(utf));
+	Free(utf);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the message dialog
+void CndMsgDlgFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the password input dialog
+bool CncPasswordDlg(SESSION *session, UI_PASSWORD_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	bool ret = false;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		Wait(session->HaltEvent, session->RetryInterval);
+		return true;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "password_dialog");
+	PackAddInt(p, "Type", dlg->Type);
+	PackAddStr(p, "Username", dlg->Username);
+	PackAddStr(p, "Password", dlg->Password);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+	PackAddBool(p, "AdminMode", dlg->AdminMode);
+	PackAddBool(p, "ShowNoSavePassword", dlg->ShowNoSavePassword);
+	PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Session = session;
+	dp->Sock = s;
+	dp->Event = NewEvent();
+
+	t = NewThread(CncConnectErrorDlgHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ok");
+		dlg->NoSavePassword = PackGetBool(p, "NoSavePassword");
+		dlg->ProxyServer = PackGetBool(p, "ProxyServer");
+		dlg->Type = PackGetInt(p, "Type");
+		PackGetStr(p, "Username", dlg->Username, sizeof(dlg->Username));
+		PackGetStr(p, "Password", dlg->Password, sizeof(dlg->Password));
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Thread to stop the connection error dialog client forcibly
+void CncConnectErrorDlgHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the connection error dialog
+bool CncConnectErrorDlg(SESSION *session, UI_CONNECTERROR_DLG *dlg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/connect_error/%s", dlg->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "connecterror_dialog");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "Err", dlg->Err);
+	PackAddInt(p, "CurrentRetryCount", dlg->CurrentRetryCount);
+	PackAddInt(p, "RetryLimit", dlg->RetryLimit);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	p = RecvPack(mqtt_client);
+	if (p != NULL)
+	{
+		dlg->HideWindow = PackGetBool(p, "HideWindow");
+
+		FreePack(p);
+	}
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return true;
+}
+
+// Thread for the status indicator client
+void CncStatusPrinterWindowThreadProc(THREAD *thread, void *param)
+{
+	CNC_STATUS_PRINTER_WINDOW_PARAM *pp;
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", pp->Session->Account->ClientOption->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	StopSessionEx(pp->Session, true);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Create a status indicator client
+SOCK *CncStatusPrinterWindowStart(SESSION *s)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", s->Account->ClientOption->AccountName);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "status_printer");
+	PackAddUniStr(p, "account_name", s->Account->ClientOption->AccountName);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	CNC_STATUS_PRINTER_WINDOW_PARAM *param = ZeroMalloc(sizeof(CNC_STATUS_PRINTER_WINDOW_PARAM));
+	param->Session = s;
+
+	THREAD *t = NewThread(CncStatusPrinterWindowThreadProc, param);
+	WaitThreadInit(t);
+
+	ReleaseThread(t);
+
+	return (SOCK *)mqtt_client;
+}
+
+// Send a string to the status indicator
+void CncStatusPrinterWindowPrint(SOCK *s, wchar_t *str)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", str);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = str;
+	pubmsg.payloadlen = wcslen(str) * sizeof(wchar_t);
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+}
+
+// Stop the status indicator client
+void CncStatusPrinterWindowStop(SOCK *s)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Start the driver installer for Windows Vista
+bool CncExecDriverInstaller(char *arg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exec_driver_installer");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exec_driver_installer");
+	PackAddStr(p, "arg", arg);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	bool ret = *(bool *)msg_payload;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return ret;
+}
+
+// Let the current running client notification services releasing the socket
+void CncReleaseSocket()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/release_socket");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "release_socket");
+
+#ifdef OS_WIN32
+	PackAddInt(p, "pid", MsGetProcessId());
+#endif	// OS_WIN32
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Terminate the process of the client notification service
+void CncExit()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exit");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exit");
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+#ifdef	OS_WIN32
+	MsKillOtherInstanceEx("vpnclient");
+#endif	// OS_WIN32
+}
+
+// Connect to the client notification service
+SOCK *CncConnect()
+{
+	return CncConnectEx(0);
+}
+SOCK *CncConnectEx(UINT timeout)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	return (SOCK *)mqtt_client;
+}
+
+#ifdef	OS_WIN32
+
+// Thread for the certificate check dialog
+void Win32CnCheckCertThreadProc(THREAD *thread, void *param)
+{
+	UI_CHECKCERT *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CHECKCERT *)param;
+
+	CheckCertDlg(dlg);
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "Ok", dlg->Ok);
+		PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Certificate check dialog
+void Win32CnCheckCert(SOCK *s, PACK *p)
+{
+	UI_CHECKCERT dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.x = PackGetX(p, "x");
+	dlg.parent_x = PackGetX(p, "parent_x");
+	dlg.old_x = PackGetX(p, "old_x");
+	dlg.DiffWarning = PackGetBool(p, "DiffWarning");
+	dlg.Ok = PackGetBool(p, "Ok");
+	dlg.SaveServerCert = PackGetBool(p, "SaveServerCert");
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnCheckCertThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	FreeX(dlg.parent_x);
+	FreeX(dlg.old_x);
+	FreeX(dlg.x);
+}
+
+// Message display dialog thread procedure
+void Win32CnMsgDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_MSG_DLG *dlg = (UI_MSG_DLG *)param;
+	wchar_t tmp[MAX_SIZE];
+	char url[MAX_SIZE];
+	// Validate arguments
+	if (thread == NULL || dlg == NULL)
+	{
+		return;
+	}
+
+	UniFormat(tmp, sizeof(tmp), _UU("CM_MSG_TITLE"),
+		dlg->ServerName, dlg->HubName);
+
+	if (IsURLMsg(dlg->Msg, url, sizeof(url)) == false)
+	{
+		OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+	}
+	else
+	{
+		if (MsExecute(url, NULL) == false)
+		{
+			OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+		}
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// NIC information dialog thread procedure
+void Win32CnNicInfoThreadProc(THREAD *thread, void *param)
+{
+	UI_NICINFO *info = (UI_NICINFO *)param;
+	// Validate arguments
+	if (thread == NULL || info == NULL)
+	{
+		return;
+	}
+
+	NicInfo(info);
+
+	Disconnect(info->Sock);
+}
+
+// NIC information dialog
+void Win32CnNicInfo(SOCK *s, PACK *p)
+{
+	UI_NICINFO info;
+	THREAD *t;
+	Zero(&info, sizeof(info));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "NicName", info.NicName, sizeof(info.NicName));
+	PackGetUniStr(p, "AccountName", info.AccountName, sizeof(info.AccountName));
+
+	info.Sock = s;
+
+	t = NewThread(Win32CnNicInfoThreadProc, &info);
+
+	FreePack(RecvPack(s));
+
+	info.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+}
+
+// Message display dialog
+void Win32CnMsgDlg(SOCK *s, PACK *p)
+{
+	UI_MSG_DLG dlg;
+	THREAD *t;
+	UINT utf_size;
+	char *utf;
+	wchar_t *msg;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	PackGetStr(p, "HubName", dlg.HubName, sizeof(dlg.HubName));
+
+	utf_size = PackGetDataSize(p, "Msg");
+	utf = ZeroMalloc(utf_size + 8);
+
+	PackGetData(p, "Msg", utf);
+
+	msg = CopyUtfToUni(utf);
+	Free(utf);
+
+	dlg.Sock = s;
+	dlg.Msg = msg;
+
+	t = NewThread(Win32CnMsgDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	Free(msg);
+}
+
+// Thread for Password input dialog
+void Win32CnPasswordDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_PASSWORD_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_PASSWORD_DLG *)param;
+
+	if (PasswordDlg(NULL, dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddStr(p, "Username", dlg->Username);
+		PackAddStr(p, "Password", dlg->Password);
+		PackAddInt(p, "Type", dlg->Type);
+		PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+		PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Password input dialog
+void Win32CnPasswordDlg(SOCK *s, PACK *p)
+{
+	UI_PASSWORD_DLG dlg;
+	THREAD *t = NULL;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	dlg.Type = PackGetInt(p, "Type");
+	PackGetStr(p, "Username", dlg.Username, sizeof(dlg.Username));
+	PackGetStr(p, "Password", dlg.Password, sizeof(dlg.Password));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.ProxyServer = PackGetBool(p, "ProxyServer");
+	dlg.AdminMode = PackGetBool(p, "AdminMode");
+	dlg.ShowNoSavePassword = PackGetBool(p, "ShowNoSavePassword");
+	dlg.NoSavePassword = PackGetBool(p, "NoSavePassword");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnPasswordDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Thread for the connection error dialog
+void Win32CnConnectErrorDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_CONNECTERROR_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CONNECTERROR_DLG *)param;
+
+	if (ConnectErrorDlg(dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Connection Error dialog (Win32)
+void Win32CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	UI_CONNECTERROR_DLG dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.Err = PackGetInt(p, "Err");
+	dlg.CurrentRetryCount = PackGetInt(p, "CurrentRetryCount");
+	dlg.RetryLimit = PackGetInt(p, "RetryLimit");
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.HideWindow = PackGetBool(p, "HideWindow");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnConnectErrorDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Status indicator (Win32)
+void Win32CnStatusPrinter(SOCK *s, PACK *p)
+{
+	STATUS_WINDOW *w;
+	wchar_t account_name[MAX_ACCOUNT_NAME_LEN + 1];
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "account_name", account_name, sizeof(account_name));
+
+	w = StatusPrinterWindowStart(s, account_name);
+
+	while (true)
+	{
+		PACK *p = RecvPack(s);
+
+		if (p == NULL)
+		{
+			// Exit the dialog because it is disconnected
+			break;
+		}
+		else
+		{
+			wchar_t tmp[MAX_SIZE];
+
+			// Rewrite the string
+			PackGetUniStr(p, "string", tmp, sizeof(tmp));
+
+			StatusPrinterWindowPrint(w, tmp);
+
+			FreePack(p);
+		}
+	}
+
+	StatusPrinterWindowStop(w);
+}
+
+// Start the driver installer (for Windows Vista)
+void Win32CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	char arg[MAX_SIZE];
+	bool ret;
+	void *helper = NULL;
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	if (PackGetStr(p, "arg", arg, sizeof(arg)) == false)
+	{
+		return;
+	}
+
+	helper = CmStartUacHelper();
+
+	ret = MsExecDriverInstaller(arg);
+
+	CmStopUacHelper(helper);
+
+	p = NewPack();
+	PackAddBool(p, "ret", ret);
+	SendPack(s, p);
+
+	FreePack(p);
+}
+
+#endif	// OS_WIN32
+
+// Start the driver installer
+void CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnExecDriverInstaller(s, p);
+#endif	// OS_WIN32
+}
+
+// Certificate confirmation dialog
+void CnCheckCert(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnCheckCert(s, p);
+#endif	// OS_WIN32
+}
+
+// NIC information dialog
+void CnNicInfo(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnNicInfo(s, p);
+#endif	// OS_WIN32
+}
+
+// Message display dialog
+void CnMsgDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnMsgDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Password input dialog
+void CnPasswordDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnPasswordDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Connection Error dialog
+void CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnConnectErrorDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Status indicator
+void CnStatusPrinter(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnStatusPrinter(s, p);
+#endif	// OS_WIN32
+}
+// Client notification service listener thread
+void CnListenerProc(THREAD *thread, void *param)
+{
+	TCP_ACCEPTED_PARAM *data = (TCP_ACCEPTED_PARAM *)param;
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (data == NULL || thread == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	//Set Application ID
+	JL_SetCurrentProcessExplicitAppUserModelID(APPID_CM);
+#endif	// OS_WIN32
+}
+// SoftEther VPN Source Code - Developer Edition Master Branch
+// Cedar Communication Module
+// © 2020 Nokia
+
+// Client.c
+// Client Manager
+
+#include "Client.h"
+
+#include "Account.h"
+#include "Admin.h"
+#include "Cedar.h"
+#include "CM.h"
+#include "Connection.h"
+#include "IPC.h"
+#include "Listener.h"
+#include "Logging.h"
+#include "Protocol.h"
+#include "Remote.h"
+#include "Virtual.h"
+#include "VLanUnix.h"
+#include "VLanWin32.h"
+#include "Win32Com.h"
+#include "WinUi.h"
+#ifdef	NO_VLAN
+#include "NullLan.h"
+#endif
+
+#include "Mayaqua/Cfg.h"
+#include "Mayaqua/Encrypt.h"
+#include "Mayaqua/FileIO.h"
+#include "Mayaqua/Internat.h"
+#include "Mayaqua/Kernel.h"
+#include "Mayaqua/MayaType.h"
+#include "Mayaqua/Memory.h"
+#include "Mayaqua/Microsoft.h"
+#include "Mayaqua/Network.h"
+#include "Mayaqua/Object.h"
+#include "Mayaqua/OS.h"
+#include "Mayaqua/Pack.h"
+#include "Mayaqua/Secure.h"
+#include "Mayaqua/Str.h"
+#include "Mayaqua/Table.h"
+#include "Mayaqua/Tick64.h"
+#include "Mayaqua/Win32.h"
+
+#include <stdlib.h>
+
+static CLIENT *client = NULL;
+static LISTENER *cn_listener = NULL;
+static LOCK *cn_listener_lock = NULL;
+static UINT64 cn_next_allow = 0;
+static LOCK *ci_active_sessions_lock = NULL;
+static UINT ci_num_active_sessions = 0;
+// SoftEther VPN Source Code - Developer Edition Master Branch
+// Cedar Communication Module
+// © 2020 Nokia
+
+// Client.c
+// Client Manager
+
+#include "Client.h"
+
+#include "Account.h"
+#include "Admin.h"
+#include "Cedar.h"
+#include "CM.h"
+#include "Connection.h"
+#include "IPC.h"
+#include "Listener.h"
+#include "Logging.h"
+#include "Protocol.h"
+#include "Remote.h"
+#include "Virtual.h"
+#include "VLanUnix.h"
+#include "VLanWin32.h"
+#include "Win32Com.h"
+#include "WinUi.h"
+#ifdef	NO_VLAN
+#include "NullLan.h"
+#endif
+
+#include "Mayaqua/Cfg.h"
+#include "Mayaqua/Encrypt.h"
+#include "Mayaqua/FileIO.h"
+#include "Mayaqua/Internat.h"
+#include "Mayaqua/Kernel.h"
+#include "Mayaqua/MayaType.h"
+#include "Mayaqua/Memory.h"
+#include "Mayaqua/Microsoft.h"
+#include "Mayaqua/Network.h"
+#include "Mayaqua/Object.h"
+#include "Mayaqua/OS.h"
+#include "Mayaqua/Pack.h"
+#include "Mayaqua/Secure.h"
+#include "Mayaqua/Str.h"
+#include "Mayaqua/Table.h"
+#include "Mayaqua/Tick64.h"
+#include "Mayaqua/Win32.h"
+
+#include <stdlib.h>
+
+static CLIENT *client = NULL;
+static LISTENER *cn_listener = NULL;
+static LOCK *cn_listener_lock = NULL;
+static UINT64 cn_next_allow = 0;
+static LOCK *ci_active_sessions_lock = NULL;
+static UINT ci_num_active_sessions = 0;
+
+
+// 在Windows中 8或稍后，更改不合理的WCM设置，以确保VPN正常运行
+void CiDisableWcmNetworkMinimize(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	// 验证参数
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (c->Config.NoChangeWcmNetworkSettingOnWindows8)
+	{
+		return;
+	}
+
+	MsDisableWcmNetworkMinimize();
+#endif	// OS_WIN32
+}
+
+// 按上次连接日期比较RPC_CLIENT_ENUM_ACCOUNT_ITEM项目（反向）
+int CiCompareClientAccountEnumItemByLastConnectDateTime(void *p1, void *p2)
+{
+	RPC_CLIENT_ENUM_ACCOUNT_ITEM *a1, *a2;
+	if (p1 == NULL || p2 == NULL)
+	{
+		return 0;
+	}
+	a1 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p1;
+	a2 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p2;
+	if (a1 == NULL || a2 == NULL)
+	{
+		return 0;
+	}
+	if (a1->LastConnectDateTime > a2->LastConnectDateTime)
+	{
+		return -1;
+	}
+	else if (a1->LastConnectDateTime < a2->LastConnectDateTime)
+	{
+		return 1;
+	}
+
+	return 0;
+}
+
+// 如果机器发生更改，请重新排列所有虚拟NIC的MAC地址
+void CiChangeAllVLanMacAddressIfMachineChanged(CLIENT *c)
+{
+	UCHAR current_hash_new[SHA1_SIZE];
+	UCHAR current_hash[SHA1_SIZE];
+	UCHAR current_hash_old[SHA1_SIZE];
+	UCHAR saved_hash[SHA1_SIZE];
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+#ifdef OS_WIN32
+	if (MsIsAdmin() == false)
+	{
+		return;
+	}
+#endif
+
+	CiGetCurrentMachineHashNew(current_hash_new);
+	CiGetCurrentMachineHash(current_hash);
+	CiGetCurrentMachineHashOld(current_hash_old);
+
+	if (CiReadLastMachineHash(saved_hash) == false)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_old, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_new, SHA1_SIZE) == 0)
+	{
+		return;
+	}
+
+	if (CiWriteLastMachineHash(current_hash_new) == false)
+	{
+		return;
+	}
+
+	CiChangeAllVLanMacAddress(c);
+}
+
+// 获取当前计算机哈希值（旧）
+void CiGetCurrentMachineHashOld(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	// Product ID
+	product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductId");
+	if (product_id == NULL)
+	{
+		product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", "ProductId");
+	}
+
+	StrCpy(name, sizeof(name), product_id);
+
+	Free(product_id);
+
+#else	// OS_WIN32
+	GetMachineName(name, sizeof(name));
+#endif	// OS_WIN32
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// Get current machine hash
+void CiGetCurrentMachineHash(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// 获取当前计算机哈希值（不使用域名）
+void CiGetCurrentMachineHashNew(void *data)
+{
+	char name[MAX_PATH];
+	char *p;
+
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	// Ignore after first period(.)
+	for(p=name; *p; p++)
+		if(*p == '.')
+			*p = 0;
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+
+// 写入机器哈希
+bool CiWriteLastMachineHash(void *data)
+{
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	if (MsRegWriteBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", data, SHA1_SIZE, true) == false)
+	{
+		return false;
+	}
+
+	return true;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// Get previous machine hash
+bool CiReadLastMachineHash(void *data)
+{
+	BUF *b = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	b = MsRegReadBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", true);
+	if (b == NULL)
+	{
+		return false;
+	}
+	if (b->Size == SHA1_SIZE)
+	{
+		Copy(data, b->Buf, b->Size);
+		FreeBuf(b);
+
+		return true;
+	}
+
+	FreeBuf(b);
+	return false;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// 如果每个虚拟LAN卡的MAC地址已被删除，请将其设置为随机数
+// (measures for Windows 8 -> 8.1 upgrade problem)
+void CiChangeAllVLanMacAddressIfCleared(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (MsIsInfCatalogRequired() == false)
+	{
+		// Not required for other than Windows 8
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress))
+			{
+				if (mac[0] == 0x00 &&
+					mac[1] == 0x00 &&
+					mac[2] == 0x01 &&
+					mac[3] == 0x00 &&
+					mac[4] == 0x00 &&
+					mac[5] == 0x01)
+				{
+					char *name = e->DeviceName;
+					RPC_CLIENT_SET_VLAN s;
+					UCHAR mac[6];
+
+					GenMacAddress(mac);
+
+					Zero(&s, sizeof(s));
+					StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+					MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+					CtSetVLan(c, &s);
+				}
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+#endif	// OS_WIN32
+}
+
+// 将所有虚拟LAN卡的MAC地址设置为随机数
+void CiChangeAllVLanMacAddress(CLIENT *c)
+{
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress) && ((mac[0] == 0x00 && mac[1] == 0xAC) || (mac[0] == 0x5E)))
+			{
+				char *name = e->DeviceName;
+				RPC_CLIENT_SET_VLAN s;
+				UCHAR mac[6];
+
+				GenMacAddress(mac);
+
+				Zero(&s, sizeof(s));
+				StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+				MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+				CtSetVLan(c, &s);
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+}
+
+// Wait for preparation of notification service to complete
+void CnWaitForCnServiceReady()
+{
+	UINT64 start_time = Tick64();
+
+	while ((start_time + (UINT64)CLIENT_WAIT_CN_READY_TIMEOUT) >= Tick64())
+	{
+		if (CnIsCnServiceReady())
+		{
+			break;
+		}
+
+		SleepThread(100);
+	}
+}
+
+// Check whether preparation of notification service completed
+bool CnIsCnServiceReady()
+{
+	SOCK *s;
+	// Confirm running the notification service
+	if (CnCheckAlreadyExists(false) == false)
+	{
+		// Not running
+		return false;
+	}
+
+	// Try to connect to the TCP port
+	s = ConnectEx("localhost", CLIENT_NOTIFY_PORT, 500);
+	if (s == NULL)
+	{
+		// The TCP port is not opened
+		return false;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	// Running
+	return true;
+}
+
+// Check whether the notification service is already running
+bool CnCheckAlreadyExists(bool lock)
+{
+#ifdef	OS_WIN32
+	return Win32CnCheckAlreadyExists(lock);
+#else
+	return false;
+#endif
+}
+
+typedef struct CNC_STATUS_PRINTER_WINDOW_PARAM
+{
+	THREAD *Thread;
+	SESSION *Session;
+	SOCK *Sock;
+} CNC_STATUS_PRINTER_WINDOW_PARAM;
+
+typedef struct CNC_CONNECT_ERROR_DLG_THREAD_PARAM
+{
+	SESSION *Session;
+	SOCK *Sock;
+	bool HaltThread;
+	EVENT *Event;
+} CNC_CONNECT_ERROR_DLG_THREAD_PARAM;
+
+// Thread to stop forcibly the Certificate check dialog client
+void CncCheckCertHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the certification check dialog
+void CncCheckCert(SESSION *session, UI_CHECKCERT *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "check_cert");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddX(p, "x", dlg->x);
+	PackAddX(p, "parent_x", dlg->parent_x);
+	PackAddX(p, "old_x", dlg->old_x);
+	PackAddBool(p, "DiffWarning", dlg->DiffWarning);
+	PackAddBool(p, "Ok", dlg->Ok);
+	PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Sock = s;
+	dp->Event = NewEvent();
+	dp->Session = session;
+
+	t = NewThread(CncCheckCertHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		dlg->Ok = PackGetBool(p, "Ok");
+		dlg->DiffWarning = PackGetBool(p, "DiffWarning");
+		dlg->SaveServerCert = PackGetBool(p, "SaveServerCert");
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Smart card signature dialog
+bool CncSecureSignDlg(SECURE_SIGN *sign)
+{
+	SOCK *s;
+	PACK *p;
+	bool ret = false;
+	// Validate arguments
+	if (sign == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return false;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "secure_sign");
+	OutRpcSecureSign(p, sign);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ret");
+
+		if (ret)
+		{
+			FreeRpcSecureSign(sign);
+
+			Zero(sign, sizeof(SECURE_SIGN));
+			InRpcSecureSign(sign, p);
+		}
+
+		FreePack(p);
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Show the NIC information dialog
+SOCK *CncNicInfo(UI_NICINFO *info)
+{
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (info == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "nicinfo");
+	PackAddStr(p, "NicName", info->NicName);
+	PackAddUniStr(p, "AccountName", info->AccountName);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the NIC information dialog
+void CncNicInfoFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the message dialog
+SOCK *CncMsgDlg(UI_MSG_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	char *utf;
+	// Validate arguments
+	if (dlg == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "msg_dialog");
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddStr(p, "HubName", dlg->HubName);
+	utf = CopyUniToUtf(dlg->Msg);
+	PackAddData(p, "Msg", utf, StrLen(utf));
+	Free(utf);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the message dialog
+void CndMsgDlgFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the password input dialog
+bool CncPasswordDlg(SESSION *session, UI_PASSWORD_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	bool ret = false;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		Wait(session->HaltEvent, session->RetryInterval);
+		return true;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "password_dialog");
+	PackAddInt(p, "Type", dlg->Type);
+	PackAddStr(p, "Username", dlg->Username);
+	PackAddStr(p, "Password", dlg->Password);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+	PackAddBool(p, "AdminMode", dlg->AdminMode);
+	PackAddBool(p, "ShowNoSavePassword", dlg->ShowNoSavePassword);
+	PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Session = session;
+	dp->Sock = s;
+	dp->Event = NewEvent();
+
+	t = NewThread(CncConnectErrorDlgHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ok");
+		dlg->NoSavePassword = PackGetBool(p, "NoSavePassword");
+		dlg->ProxyServer = PackGetBool(p, "ProxyServer");
+		dlg->Type = PackGetInt(p, "Type");
+		PackGetStr(p, "Username", dlg->Username, sizeof(dlg->Username));
+		PackGetStr(p, "Password", dlg->Password, sizeof(dlg->Password));
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Thread to stop the connection error dialog client forcibly
+void CncConnectErrorDlgHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the connection error dialog
+bool CncConnectErrorDlg(SESSION *session, UI_CONNECTERROR_DLG *dlg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/connect_error/%s", dlg->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "connecterror_dialog");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "Err", dlg->Err);
+	PackAddInt(p, "CurrentRetryCount", dlg->CurrentRetryCount);
+	PackAddInt(p, "RetryLimit", dlg->RetryLimit);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	p = RecvPack(mqtt_client);
+	if (p != NULL)
+	{
+		dlg->HideWindow = PackGetBool(p, "HideWindow");
+
+		FreePack(p);
+	}
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return true;
+}
+
+// Thread for the status indicator client
+void CncStatusPrinterWindowThreadProc(THREAD *thread, void *param)
+{
+	CNC_STATUS_PRINTER_WINDOW_PARAM *pp;
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", pp->Session->Account->ClientOption->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	StopSessionEx(pp->Session, true);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Create a status indicator client
+SOCK *CncStatusPrinterWindowStart(SESSION *s)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", s->Account->ClientOption->AccountName);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "status_printer");
+	PackAddUniStr(p, "account_name", s->Account->ClientOption->AccountName);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	CNC_STATUS_PRINTER_WINDOW_PARAM *param = ZeroMalloc(sizeof(CNC_STATUS_PRINTER_WINDOW_PARAM));
+	param->Session = s;
+
+	THREAD *t = NewThread(CncStatusPrinterWindowThreadProc, param);
+	WaitThreadInit(t);
+
+	ReleaseThread(t);
+
+	return (SOCK *)mqtt_client;
+}
+
+// Send a string to the status indicator
+void CncStatusPrinterWindowPrint(SOCK *s, wchar_t *str)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", str);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = str;
+	pubmsg.payloadlen = wcslen(str) * sizeof(wchar_t);
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+}
+
+// Stop the status indicator client
+void CncStatusPrinterWindowStop(SOCK *s)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Start the driver installer for Windows Vista
+bool CncExecDriverInstaller(char *arg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exec_driver_installer");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exec_driver_installer");
+	PackAddStr(p, "arg", arg);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	bool ret = *(bool *)msg_payload;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return ret;
+}
+
+// Let the current running client notification services releasing the socket
+void CncReleaseSocket()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/release_socket");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "release_socket");
+
+#ifdef OS_WIN32
+	PackAddInt(p, "pid", MsGetProcessId());
+#endif	// OS_WIN32
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Terminate the process of the client notification service
+void CncExit()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exit");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exit");
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+#ifdef	OS_WIN32
+	MsKillOtherInstanceEx("vpnclient");
+#endif	// OS_WIN32
+}
+
+// Connect to the client notification service
+SOCK *CncConnect()
+{
+	return CncConnectEx(0);
+}
+SOCK *CncConnectEx(UINT timeout)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	return (SOCK *)mqtt_client;
+}
+
+#ifdef	OS_WIN32
+
+// Thread for the certificate check dialog
+void Win32CnCheckCertThreadProc(THREAD *thread, void *param)
+{
+	UI_CHECKCERT *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CHECKCERT *)param;
+
+	CheckCertDlg(dlg);
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "Ok", dlg->Ok);
+		PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Certificate check dialog
+void Win32CnCheckCert(SOCK *s, PACK *p)
+{
+	UI_CHECKCERT dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.x = PackGetX(p, "x");
+	dlg.parent_x = PackGetX(p, "parent_x");
+	dlg.old_x = PackGetX(p, "old_x");
+	dlg.DiffWarning = PackGetBool(p, "DiffWarning");
+	dlg.Ok = PackGetBool(p, "Ok");
+	dlg.SaveServerCert = PackGetBool(p, "SaveServerCert");
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnCheckCertThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	FreeX(dlg.parent_x);
+	FreeX(dlg.old_x);
+	FreeX(dlg.x);
+}
+
+// Message display dialog thread procedure
+void Win32CnMsgDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_MSG_DLG *dlg = (UI_MSG_DLG *)param;
+	wchar_t tmp[MAX_SIZE];
+	char url[MAX_SIZE];
+	// Validate arguments
+	if (thread == NULL || dlg == NULL)
+	{
+		return;
+	}
+
+	UniFormat(tmp, sizeof(tmp), _UU("CM_MSG_TITLE"),
+		dlg->ServerName, dlg->HubName);
+
+	if (IsURLMsg(dlg->Msg, url, sizeof(url)) == false)
+	{
+		OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+	}
+	else
+	{
+		if (MsExecute(url, NULL) == false)
+		{
+			OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+		}
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// NIC information dialog thread procedure
+void Win32CnNicInfoThreadProc(THREAD *thread, void *param)
+{
+	UI_NICINFO *info = (UI_NICINFO *)param;
+	// Validate arguments
+	if (thread == NULL || info == NULL)
+	{
+		return;
+	}
+
+	NicInfo(info);
+
+	Disconnect(info->Sock);
+}
+
+// NIC information dialog
+void Win32CnNicInfo(SOCK *s, PACK *p)
+{
+	UI_NICINFO info;
+	THREAD *t;
+	Zero(&info, sizeof(info));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "NicName", info.NicName, sizeof(info.NicName));
+	PackGetUniStr(p, "AccountName", info.AccountName, sizeof(info.AccountName));
+
+	info.Sock = s;
+
+	t = NewThread(Win32CnNicInfoThreadProc, &info);
+
+	FreePack(RecvPack(s));
+
+	info.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+}
+
+// Message display dialog
+void Win32CnMsgDlg(SOCK *s, PACK *p)
+{
+	UI_MSG_DLG dlg;
+	THREAD *t;
+	UINT utf_size;
+	char *utf;
+	wchar_t *msg;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	PackGetStr(p, "HubName", dlg.HubName, sizeof(dlg.HubName));
+
+	utf_size = PackGetDataSize(p, "Msg");
+	utf = ZeroMalloc(utf_size + 8);
+
+	PackGetData(p, "Msg", utf);
+
+	msg = CopyUtfToUni(utf);
+	Free(utf);
+
+	dlg.Sock = s;
+	dlg.Msg = msg;
+
+	t = NewThread(Win32CnMsgDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	Free(msg);
+}
+
+// Thread for Password input dialog
+void Win32CnPasswordDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_PASSWORD_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_PASSWORD_DLG *)param;
+
+	if (PasswordDlg(NULL, dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddStr(p, "Username", dlg->Username);
+		PackAddStr(p, "Password", dlg->Password);
+		PackAddInt(p, "Type", dlg->Type);
+		PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+		PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Password input dialog
+void Win32CnPasswordDlg(SOCK *s, PACK *p)
+{
+	UI_PASSWORD_DLG dlg;
+	THREAD *t = NULL;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	dlg.Type = PackGetInt(p, "Type");
+	PackGetStr(p, "Username", dlg.Username, sizeof(dlg.Username));
+	PackGetStr(p, "Password", dlg.Password, sizeof(dlg.Password));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.ProxyServer = PackGetBool(p, "ProxyServer");
+	dlg.AdminMode = PackGetBool(p, "AdminMode");
+	dlg.ShowNoSavePassword = PackGetBool(p, "ShowNoSavePassword");
+	dlg.NoSavePassword = PackGetBool(p, "NoSavePassword");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnPasswordDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Thread for the connection error dialog
+void Win32CnConnectErrorDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_CONNECTERROR_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CONNECTERROR_DLG *)param;
+
+	if (ConnectErrorDlg(dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Connection Error dialog (Win32)
+void Win32CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	UI_CONNECTERROR_DLG dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.Err = PackGetInt(p, "Err");
+	dlg.CurrentRetryCount = PackGetInt(p, "CurrentRetryCount");
+	dlg.RetryLimit = PackGetInt(p, "RetryLimit");
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.HideWindow = PackGetBool(p, "HideWindow");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnConnectErrorDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Status indicator (Win32)
+void Win32CnStatusPrinter(SOCK *s, PACK *p)
+{
+	STATUS_WINDOW *w;
+	wchar_t account_name[MAX_ACCOUNT_NAME_LEN + 1];
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "account_name", account_name, sizeof(account_name));
+
+	w = StatusPrinterWindowStart(s, account_name);
+
+	while (true)
+	{
+		PACK *p = RecvPack(s);
+
+		if (p == NULL)
+		{
+			// Exit the dialog because it is disconnected
+			break;
+		}
+		else
+		{
+			wchar_t tmp[MAX_SIZE];
+
+			// Rewrite the string
+			PackGetUniStr(p, "string", tmp, sizeof(tmp));
+
+			StatusPrinterWindowPrint(w, tmp);
+
+			FreePack(p);
+		}
+	}
+
+	StatusPrinterWindowStop(w);
+}
+
+// Start the driver installer (for Windows Vista)
+void Win32CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	char arg[MAX_SIZE];
+	bool ret;
+	void *helper = NULL;
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	if (PackGetStr(p, "arg", arg, sizeof(arg)) == false)
+	{
+		return;
+	}
+
+	helper = CmStartUacHelper();
+
+	ret = MsExecDriverInstaller(arg);
+
+	CmStopUacHelper(helper);
+
+	p = NewPack();
+	PackAddBool(p, "ret", ret);
+	SendPack(s, p);
+
+	FreePack(p);
+}
+
+#endif	// OS_WIN32
+
+// Start the driver installer
+void CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnExecDriverInstaller(s, p);
+#endif	// OS_WIN32
+}
+
+// Certificate confirmation dialog
+void CnCheckCert(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnCheckCert(s, p);
+#endif	// OS_WIN32
+}
+
+// NIC information dialog
+void CnNicInfo(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnNicInfo(s, p);
+#endif	// OS_WIN32
+}
+
+// Message display dialog
+void CnMsgDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnMsgDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Password input dialog
+void CnPasswordDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnPasswordDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Connection Error dialog
+void CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnConnectErrorDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Status indicator
+void CnStatusPrinter(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnStatusPrinter(s, p);
+#endif	// OS_WIN32
+}
+// Client notification service listener thread
+void CnListenerProc(THREAD *thread, void *param)
+{
+	TCP_ACCEPTED_PARAM *data = (TCP_ACCEPTED_PARAM *)param;
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (data == NULL || thread == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	//Set Application ID
+	JL_SetCurrentProcessExplicitAppUserModelID(APPID_CM);
+#endif	// OS_WIN32
+}
+// SoftEther VPN Source Code - Developer Edition Master Branch
+// Cedar Communication Module
+// © 2020 Nokia
+
+// Client.c
+// Client Manager
+
+#include "Client.h"
+
+#include "Account.h"
+#include "Admin.h"
+#include "Cedar.h"
+#include "CM.h"
+#include "Connection.h"
+#include "IPC.h"
+#include "Listener.h"
+#include "Logging.h"
+#include "Protocol.h"
+#include "Remote.h"
+#include "Virtual.h"
+#include "VLanUnix.h"
+#include "VLanWin32.h"
+#include "Win32Com.h"
+#include "WinUi.h"
+#ifdef	NO_VLAN
+#include "NullLan.h"
+#endif
+
+#include "Mayaqua/Cfg.h"
+#include "Mayaqua/Encrypt.h"
+#include "Mayaqua/FileIO.h"
+#include "Mayaqua/Internat.h"
+#include "Mayaqua/Kernel.h"
+#include "Mayaqua/MayaType.h"
+#include "Mayaqua/Memory.h"
+#include "Mayaqua/Microsoft.h"
+#include "Mayaqua/Network.h"
+#include "Mayaqua/Object.h"
+#include "Mayaqua/OS.h"
+#include "Mayaqua/Pack.h"
+#include "Mayaqua/Secure.h"
+#include "Mayaqua/Str.h"
+#include "Mayaqua/Table.h"
+#include "Mayaqua/Tick64.h"
+#include "Mayaqua/Win32.h"
+
+#include <stdlib.h>
+
+static CLIENT *client = NULL;
+static LISTENER *cn_listener = NULL;
+static LOCK *cn_listener_lock = NULL;
+static UINT64 cn_next_allow = 0;
+static LOCK *ci_active_sessions_lock = NULL;
+static UINT ci_num_active_sessions = 0;
+
+
+// 在Windows中 8或稍后，更改不合理的WCM设置，以确保VPN正常运行
+void CiDisableWcmNetworkMinimize(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	// 验证参数
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (c->Config.NoChangeWcmNetworkSettingOnWindows8)
+	{
+		return;
+	}
+
+	MsDisableWcmNetworkMinimize();
+#endif	// OS_WIN32
+}
+
+// 按上次连接日期比较RPC_CLIENT_ENUM_ACCOUNT_ITEM项目（反向）
+int CiCompareClientAccountEnumItemByLastConnectDateTime(void *p1, void *p2)
+{
+	RPC_CLIENT_ENUM_ACCOUNT_ITEM *a1, *a2;
+	if (p1 == NULL || p2 == NULL)
+	{
+		return 0;
+	}
+	a1 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p1;
+	a2 = *(RPC_CLIENT_ENUM_ACCOUNT_ITEM **)p2;
+	if (a1 == NULL || a2 == NULL)
+	{
+		return 0;
+	}
+	if (a1->LastConnectDateTime > a2->LastConnectDateTime)
+	{
+		return -1;
+	}
+	else if (a1->LastConnectDateTime < a2->LastConnectDateTime)
+	{
+		return 1;
+	}
+
+	return 0;
+}
+
+// 如果机器发生更改，请重新排列所有虚拟NIC的MAC地址
+void CiChangeAllVLanMacAddressIfMachineChanged(CLIENT *c)
+{
+	UCHAR current_hash_new[SHA1_SIZE];
+	UCHAR current_hash[SHA1_SIZE];
+	UCHAR current_hash_old[SHA1_SIZE];
+	UCHAR saved_hash[SHA1_SIZE];
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+#ifdef OS_WIN32
+	if (MsIsAdmin() == false)
+	{
+		return;
+	}
+#endif
+
+	CiGetCurrentMachineHashNew(current_hash_new);
+	CiGetCurrentMachineHash(current_hash);
+	CiGetCurrentMachineHashOld(current_hash_old);
+
+	if (CiReadLastMachineHash(saved_hash) == false)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_old, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash, SHA1_SIZE) == 0)
+	{
+		CiWriteLastMachineHash(current_hash_new);
+		return;
+	}
+
+	if (Cmp(saved_hash, current_hash_new, SHA1_SIZE) == 0)
+	{
+		return;
+	}
+
+	if (CiWriteLastMachineHash(current_hash_new) == false)
+	{
+		return;
+	}
+
+	CiChangeAllVLanMacAddress(c);
+}
+
+// 获取当前计算机哈希值（旧）
+void CiGetCurrentMachineHashOld(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	// Product ID
+	product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductId");
+	if (product_id == NULL)
+	{
+		product_id = MsRegReadStr(REG_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", "ProductId");
+	}
+
+	StrCpy(name, sizeof(name), product_id);
+
+	Free(product_id);
+
+#else	// OS_WIN32
+	GetMachineName(name, sizeof(name));
+#endif	// OS_WIN32
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// Get current machine hash
+void CiGetCurrentMachineHash(void *data)
+{
+	char name[MAX_PATH];
+	char *product_id = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+// 获取当前计算机哈希值（不使用域名）
+void CiGetCurrentMachineHashNew(void *data)
+{
+	char name[MAX_PATH];
+	char *p;
+
+	// Validate arguments
+	if (data == NULL)
+	{
+		return;
+	}
+
+	GetMachineName(name, sizeof(name));
+
+	// Ignore after first period(.)
+	for(p=name; *p; p++)
+		if(*p == '.')
+			*p = 0;
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha0(data, name, StrLen(name));
+}
+
+
+// 写入机器哈希
+bool CiWriteLastMachineHash(void *data)
+{
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	if (MsRegWriteBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", data, SHA1_SIZE, true) == false)
+	{
+		return false;
+	}
+
+	return true;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// Get previous machine hash
+bool CiReadLastMachineHash(void *data)
+{
+	BUF *b = NULL;
+	// Validate arguments
+	if (data == NULL)
+	{
+		return false;
+	}
+
+#ifdef OS_WIN32
+	b = MsRegReadBinEx(REG_LOCAL_MACHINE, MS_REG_TCP_SETTING_KEY, "LastMachineHash", true);
+	if (b == NULL)
+	{
+		return false;
+	}
+	if (b->Size == SHA1_SIZE)
+	{
+		Copy(data, b->Buf, b->Size);
+		FreeBuf(b);
+
+		return true;
+	}
+
+	FreeBuf(b);
+	return false;
+#else	// OS_WIN32
+	return false;
+#endif	// OS_WIN32
+}
+
+// 如果每个虚拟LAN卡的MAC地址已被删除，请将其设置为随机数
+// (measures for Windows 8 -> 8.1 upgrade problem)
+void CiChangeAllVLanMacAddressIfCleared(CLIENT *c)
+{
+#ifdef	OS_WIN32
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	if (MsIsInfCatalogRequired() == false)
+	{
+		// Not required for other than Windows 8
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress))
+			{
+				if (mac[0] == 0x00 &&
+					mac[1] == 0x00 &&
+					mac[2] == 0x01 &&
+					mac[3] == 0x00 &&
+					mac[4] == 0x00 &&
+					mac[5] == 0x01)
+				{
+					char *name = e->DeviceName;
+					RPC_CLIENT_SET_VLAN s;
+					UCHAR mac[6];
+
+					GenMacAddress(mac);
+
+					Zero(&s, sizeof(s));
+					StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+					MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+					CtSetVLan(c, &s);
+				}
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+#endif	// OS_WIN32
+}
+
+// 将所有虚拟LAN卡的MAC地址设置为随机数
+void CiChangeAllVLanMacAddress(CLIENT *c)
+{
+	RPC_CLIENT_ENUM_VLAN t;
+	// Validate arguments
+	if (c == NULL)
+	{
+		return;
+	}
+
+	Zero(&t, sizeof(t));
+	if (CtEnumVLan(c, &t))
+	{
+		UINT i;
+
+		for (i = 0;i < t.NumItem;i++)
+		{
+			RPC_CLIENT_ENUM_VLAN_ITEM *e = t.Items[i];
+			UCHAR mac[6];
+
+			if (StrToMac(mac, e->MacAddress) && ((mac[0] == 0x00 && mac[1] == 0xAC) || (mac[0] == 0x5E)))
+			{
+				char *name = e->DeviceName;
+				RPC_CLIENT_SET_VLAN s;
+				UCHAR mac[6];
+
+				GenMacAddress(mac);
+
+				Zero(&s, sizeof(s));
+				StrCpy(s.DeviceName, sizeof(s.DeviceName), name);
+
+				MacToStr(s.MacAddress, sizeof(s.MacAddress), mac);
+
+				CtSetVLan(c, &s);
+			}
+		}
+
+		CiFreeClientEnumVLan(&t);
+	}
+}
+
+// Wait for preparation of notification service to complete
+void CnWaitForCnServiceReady()
+{
+	UINT64 start_time = Tick64();
+
+	while ((start_time + (UINT64)CLIENT_WAIT_CN_READY_TIMEOUT) >= Tick64())
+	{
+		if (CnIsCnServiceReady())
+		{
+			break;
+		}
+
+		SleepThread(100);
+	}
+}
+
+// Check whether preparation of notification service completed
+bool CnIsCnServiceReady()
+{
+	SOCK *s;
+	// Confirm running the notification service
+	if (CnCheckAlreadyExists(false) == false)
+	{
+		// Not running
+		return false;
+	}
+
+	// Try to connect to the TCP port
+	s = ConnectEx("localhost", CLIENT_NOTIFY_PORT, 500);
+	if (s == NULL)
+	{
+		// The TCP port is not opened
+		return false;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	// Running
+	return true;
+}
+
+// Check whether the notification service is already running
+bool CnCheckAlreadyExists(bool lock)
+{
+#ifdef	OS_WIN32
+	return Win32CnCheckAlreadyExists(lock);
+#else
+	return false;
+#endif
+}
+
+typedef struct CNC_STATUS_PRINTER_WINDOW_PARAM
+{
+	THREAD *Thread;
+	SESSION *Session;
+	SOCK *Sock;
+} CNC_STATUS_PRINTER_WINDOW_PARAM;
+
+typedef struct CNC_CONNECT_ERROR_DLG_THREAD_PARAM
+{
+	SESSION *Session;
+	SOCK *Sock;
+	bool HaltThread;
+	EVENT *Event;
+} CNC_CONNECT_ERROR_DLG_THREAD_PARAM;
+
+// Thread to stop forcibly the Certificate check dialog client
+void CncCheckCertHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the certification check dialog
+void CncCheckCert(SESSION *session, UI_CHECKCERT *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "check_cert");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddX(p, "x", dlg->x);
+	PackAddX(p, "parent_x", dlg->parent_x);
+	PackAddX(p, "old_x", dlg->old_x);
+	PackAddBool(p, "DiffWarning", dlg->DiffWarning);
+	PackAddBool(p, "Ok", dlg->Ok);
+	PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Sock = s;
+	dp->Event = NewEvent();
+	dp->Session = session;
+
+	t = NewThread(CncCheckCertHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		dlg->Ok = PackGetBool(p, "Ok");
+		dlg->DiffWarning = PackGetBool(p, "DiffWarning");
+		dlg->SaveServerCert = PackGetBool(p, "SaveServerCert");
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Smart card signature dialog
+bool CncSecureSignDlg(SECURE_SIGN *sign)
+{
+	SOCK *s;
+	PACK *p;
+	bool ret = false;
+	// Validate arguments
+	if (sign == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		return false;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "secure_sign");
+	OutRpcSecureSign(p, sign);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ret");
+
+		if (ret)
+		{
+			FreeRpcSecureSign(sign);
+
+			Zero(sign, sizeof(SECURE_SIGN));
+			InRpcSecureSign(sign, p);
+		}
+
+		FreePack(p);
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Show the NIC information dialog
+SOCK *CncNicInfo(UI_NICINFO *info)
+{
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (info == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "nicinfo");
+	PackAddStr(p, "NicName", info->NicName);
+	PackAddUniStr(p, "AccountName", info->AccountName);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the NIC information dialog
+void CncNicInfoFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the message dialog
+SOCK *CncMsgDlg(UI_MSG_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	char *utf;
+	// Validate arguments
+	if (dlg == NULL)
+	{
+		return NULL;
+	}
+
+	s = CncConnectEx(200);
+	if (s == NULL)
+	{
+		return NULL;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "msg_dialog");
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddStr(p, "HubName", dlg->HubName);
+	utf = CopyUniToUtf(dlg->Msg);
+	PackAddData(p, "Msg", utf, StrLen(utf));
+	Free(utf);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	return s;
+}
+
+// Close the message dialog
+void CndMsgDlgFree(SOCK *s)
+{
+	// Validate arguments
+	if (s == NULL)
+	{
+		return;
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+}
+
+// Show the password input dialog
+bool CncPasswordDlg(SESSION *session, UI_PASSWORD_DLG *dlg)
+{
+	SOCK *s;
+	PACK *p;
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp;
+	THREAD *t;
+	bool ret = false;
+	// Validate arguments
+	if (dlg == NULL || session == NULL)
+	{
+		return false;
+	}
+
+	s = CncConnect();
+	if (s == NULL)
+	{
+		Wait(session->HaltEvent, session->RetryInterval);
+		return true;
+	}
+
+	p = NewPack();
+	PackAddStr(p, "function", "password_dialog");
+	PackAddInt(p, "Type", dlg->Type);
+	PackAddStr(p, "Username", dlg->Username);
+	PackAddStr(p, "Password", dlg->Password);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+	PackAddBool(p, "AdminMode", dlg->AdminMode);
+	PackAddBool(p, "ShowNoSavePassword", dlg->ShowNoSavePassword);
+	PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+	SendPack(s, p);
+	FreePack(p);
+
+	dp = ZeroMalloc(sizeof(CNC_CONNECT_ERROR_DLG_THREAD_PARAM));
+	dp->Session = session;
+	dp->Sock = s;
+	dp->Event = NewEvent();
+
+	t = NewThread(CncConnectErrorDlgHaltThread, dp);
+
+	p = RecvPack(s);
+	if (p != NULL)
+	{
+		ret = PackGetBool(p, "ok");
+		dlg->NoSavePassword = PackGetBool(p, "NoSavePassword");
+		dlg->ProxyServer = PackGetBool(p, "ProxyServer");
+		dlg->Type = PackGetInt(p, "Type");
+		PackGetStr(p, "Username", dlg->Username, sizeof(dlg->Username));
+		PackGetStr(p, "Password", dlg->Password, sizeof(dlg->Password));
+
+		FreePack(p);
+	}
+
+	dp->HaltThread = true;
+	Set(dp->Event);
+
+	WaitThread(t, INFINITE);
+
+	ReleaseEvent(dp->Event);
+	Free(dp);
+	ReleaseThread(t);
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	return ret;
+}
+
+// Thread to stop the connection error dialog client forcibly
+void CncConnectErrorDlgHaltThread(THREAD *thread, void *param)
+{
+	CNC_CONNECT_ERROR_DLG_THREAD_PARAM *dp = (CNC_CONNECT_ERROR_DLG_THREAD_PARAM *)param;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		if (dp->Session->Halt || dp->HaltThread)
+		{
+			break;
+		}
+
+		Wait(dp->Event, 100);
+	}
+
+	Disconnect(dp->Sock);
+}
+
+// Show the connection error dialog
+bool CncConnectErrorDlg(SESSION *session, UI_CONNECTERROR_DLG *dlg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/connect_error/%s", dlg->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "connecterror_dialog");
+	PackAddUniStr(p, "AccountName", dlg->AccountName);
+	PackAddStr(p, "ServerName", dlg->ServerName);
+	PackAddInt(p, "Err", dlg->Err);
+	PackAddInt(p, "CurrentRetryCount", dlg->CurrentRetryCount);
+	PackAddInt(p, "RetryLimit", dlg->RetryLimit);
+	PackAddInt(p, "RetryIntervalSec", dlg->RetryIntervalSec);
+	PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	p = RecvPack(mqtt_client);
+	if (p != NULL)
+	{
+		dlg->HideWindow = PackGetBool(p, "HideWindow");
+
+		FreePack(p);
+	}
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return true;
+}
+
+// Thread for the status indicator client
+void CncStatusPrinterWindowThreadProc(THREAD *thread, void *param)
+{
+	CNC_STATUS_PRINTER_WINDOW_PARAM *pp;
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", pp->Session->Account->ClientOption->AccountName);
+	MQTTClient_subscribe(mqtt_client, topic, QOS);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	StopSessionEx(pp->Session, true);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Create a status indicator client
+SOCK *CncStatusPrinterWindowStart(SESSION *s)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", s->Account->ClientOption->AccountName);
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "status_printer");
+	PackAddUniStr(p, "account_name", s->Account->ClientOption->AccountName);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	CNC_STATUS_PRINTER_WINDOW_PARAM *param = ZeroMalloc(sizeof(CNC_STATUS_PRINTER_WINDOW_PARAM));
+	param->Session = s;
+
+	THREAD *t = NewThread(CncStatusPrinterWindowThreadProc, param);
+	WaitThreadInit(t);
+
+	ReleaseThread(t);
+
+	return (SOCK *)mqtt_client;
+}
+
+// Send a string to the status indicator
+void CncStatusPrinterWindowPrint(SOCK *s, wchar_t *str)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/status_printer/%s", str);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = str;
+	pubmsg.payloadlen = wcslen(str) * sizeof(wchar_t);
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+}
+
+// Stop the status indicator client
+void CncStatusPrinterWindowStop(SOCK *s)
+{
+	MQTTClient mqtt_client = (MQTTClient)s;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Start the driver installer for Windows Vista
+bool CncExecDriverInstaller(char *arg)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exec_driver_installer");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exec_driver_installer");
+	PackAddStr(p, "arg", arg);
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	int msg_len;
+	char* msg_payload;
+	MQTTClient_receive(mqtt_client, &topic, &msg_len, (void**)&msg_payload, TIMEOUT);
+
+	bool ret = *(bool *)msg_payload;
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+	return ret;
+}
+
+// Let the current running client notification services releasing the socket
+void CncReleaseSocket()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/release_socket");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "release_socket");
+
+#ifdef OS_WIN32
+	PackAddInt(p, "pid", MsGetProcessId());
+#endif	// OS_WIN32
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+}
+
+// Terminate the process of the client notification service
+void CncExit()
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	char topic[256];
+	sprintf(topic, "SoftEtherVPN/exit");
+
+	PACK *p = NewPack();
+	PackAddStr(p, "function", "exit");
+
+	MQTTClient_message pubmsg = MQTTClient_message_initializer;
+	pubmsg.payload = p->Buf;
+	pubmsg.payloadlen = p->Size;
+	pubmsg.qos = QOS;
+	pubmsg.retained = 0;
+	MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, NULL);
+
+	FreePack(p);
+
+	MQTTClient_disconnect(mqtt_client, 10000);
+	MQTTClient_destroy(&mqtt_client);
+
+#ifdef	OS_WIN32
+	MsKillOtherInstanceEx("vpnclient");
+#endif	// OS_WIN32
+}
+
+// Connect to the client notification service
+SOCK *CncConnect()
+{
+	return CncConnectEx(0);
+}
+SOCK *CncConnectEx(UINT timeout)
+{
+	MQTTClient mqtt_client;
+	MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+	MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTClient_connect(mqtt_client, &conn_opts);
+
+	return (SOCK *)mqtt_client;
+}
+
+#ifdef	OS_WIN32
+
+// Thread for the certificate check dialog
+void Win32CnCheckCertThreadProc(THREAD *thread, void *param)
+{
+	UI_CHECKCERT *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CHECKCERT *)param;
+
+	CheckCertDlg(dlg);
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "Ok", dlg->Ok);
+		PackAddBool(p, "SaveServerCert", dlg->SaveServerCert);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Certificate check dialog
+void Win32CnCheckCert(SOCK *s, PACK *p)
+{
+	UI_CHECKCERT dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.x = PackGetX(p, "x");
+	dlg.parent_x = PackGetX(p, "parent_x");
+	dlg.old_x = PackGetX(p, "old_x");
+	dlg.DiffWarning = PackGetBool(p, "DiffWarning");
+	dlg.Ok = PackGetBool(p, "Ok");
+	dlg.SaveServerCert = PackGetBool(p, "SaveServerCert");
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnCheckCertThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	FreeX(dlg.parent_x);
+	FreeX(dlg.old_x);
+	FreeX(dlg.x);
+}
+
+// Message display dialog thread procedure
+void Win32CnMsgDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_MSG_DLG *dlg = (UI_MSG_DLG *)param;
+	wchar_t tmp[MAX_SIZE];
+	char url[MAX_SIZE];
+	// Validate arguments
+	if (thread == NULL || dlg == NULL)
+	{
+		return;
+	}
+
+	UniFormat(tmp, sizeof(tmp), _UU("CM_MSG_TITLE"),
+		dlg->ServerName, dlg->HubName);
+
+	if (IsURLMsg(dlg->Msg, url, sizeof(url)) == false)
+	{
+		OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+	}
+	else
+	{
+		if (MsExecute(url, NULL) == false)
+		{
+			OnceMsgEx(NULL, tmp, dlg->Msg, true, 167, &dlg->Halt);
+		}
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// NIC information dialog thread procedure
+void Win32CnNicInfoThreadProc(THREAD *thread, void *param)
+{
+	UI_NICINFO *info = (UI_NICINFO *)param;
+	// Validate arguments
+	if (thread == NULL || info == NULL)
+	{
+		return;
+	}
+
+	NicInfo(info);
+
+	Disconnect(info->Sock);
+}
+
+// NIC information dialog
+void Win32CnNicInfo(SOCK *s, PACK *p)
+{
+	UI_NICINFO info;
+	THREAD *t;
+	Zero(&info, sizeof(info));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "NicName", info.NicName, sizeof(info.NicName));
+	PackGetUniStr(p, "AccountName", info.AccountName, sizeof(info.AccountName));
+
+	info.Sock = s;
+
+	t = NewThread(Win32CnNicInfoThreadProc, &info);
+
+	FreePack(RecvPack(s));
+
+	info.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+}
+
+// Message display dialog
+void Win32CnMsgDlg(SOCK *s, PACK *p)
+{
+	UI_MSG_DLG dlg;
+	THREAD *t;
+	UINT utf_size;
+	char *utf;
+	wchar_t *msg;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	PackGetStr(p, "HubName", dlg.HubName, sizeof(dlg.HubName));
+
+	utf_size = PackGetDataSize(p, "Msg");
+	utf = ZeroMalloc(utf_size + 8);
+
+	PackGetData(p, "Msg", utf);
+
+	msg = CopyUtfToUni(utf);
+	Free(utf);
+
+	dlg.Sock = s;
+	dlg.Msg = msg;
+
+	t = NewThread(Win32CnMsgDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	dlg.Halt = true;
+
+	WaitThread(t, INFINITE);
+	ReleaseThread(t);
+
+	Free(msg);
+}
+
+// Thread for Password input dialog
+void Win32CnPasswordDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_PASSWORD_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_PASSWORD_DLG *)param;
+
+	if (PasswordDlg(NULL, dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddStr(p, "Username", dlg->Username);
+		PackAddStr(p, "Password", dlg->Password);
+		PackAddInt(p, "Type", dlg->Type);
+		PackAddBool(p, "ProxyServer", dlg->ProxyServer);
+		PackAddBool(p, "NoSavePassword", dlg->NoSavePassword);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Password input dialog
+void Win32CnPasswordDlg(SOCK *s, PACK *p)
+{
+	UI_PASSWORD_DLG dlg;
+	THREAD *t = NULL;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	dlg.Type = PackGetInt(p, "Type");
+	PackGetStr(p, "Username", dlg.Username, sizeof(dlg.Username));
+	PackGetStr(p, "Password", dlg.Password, sizeof(dlg.Password));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.ProxyServer = PackGetBool(p, "ProxyServer");
+	dlg.AdminMode = PackGetBool(p, "AdminMode");
+	dlg.ShowNoSavePassword = PackGetBool(p, "ShowNoSavePassword");
+	dlg.NoSavePassword = PackGetBool(p, "NoSavePassword");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnPasswordDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Thread for the connection error dialog
+void Win32CnConnectErrorDlgThreadProc(THREAD *thread, void *param)
+{
+	UI_CONNECTERROR_DLG *dlg;
+	// Validate arguments
+	if (thread == NULL || param == NULL)
+	{
+		return;
+	}
+
+	dlg = (UI_CONNECTERROR_DLG *)param;
+
+	if (ConnectErrorDlg(dlg))
+	{
+		PACK *p = NewPack();
+
+		PackAddBool(p, "ok", true);
+		PackAddBool(p, "HideWindow", dlg->HideWindow);
+
+		SendPack(dlg->Sock, p);
+		FreePack(p);
+
+		FreePack(RecvPack(dlg->Sock));
+	}
+
+	Disconnect(dlg->Sock);
+}
+
+// Connection Error dialog (Win32)
+void Win32CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	UI_CONNECTERROR_DLG dlg;
+	THREAD *t;
+	Zero(&dlg, sizeof(dlg));
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "AccountName", dlg.AccountName, sizeof(dlg.AccountName));
+	PackGetStr(p, "ServerName", dlg.ServerName, sizeof(dlg.ServerName));
+	dlg.Err = PackGetInt(p, "Err");
+	dlg.CurrentRetryCount = PackGetInt(p, "CurrentRetryCount");
+	dlg.RetryLimit = PackGetInt(p, "RetryLimit");
+	dlg.RetryIntervalSec = PackGetInt(p, "RetryIntervalSec");
+	dlg.HideWindow = PackGetBool(p, "HideWindow");
+	dlg.CancelEvent = NewEvent();
+	dlg.Sock = s;
+
+	t = NewThread(Win32CnConnectErrorDlgThreadProc, &dlg);
+
+	FreePack(RecvPack(s));
+
+	Set(dlg.CancelEvent);
+
+	WaitThread(t, INFINITE);
+	ReleaseEvent(dlg.CancelEvent);
+	ReleaseThread(t);
+}
+
+// Status indicator (Win32)
+void Win32CnStatusPrinter(SOCK *s, PACK *p)
+{
+	STATUS_WINDOW *w;
+	wchar_t account_name[MAX_ACCOUNT_NAME_LEN + 1];
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	PackGetUniStr(p, "account_name", account_name, sizeof(account_name));
+
+	w = StatusPrinterWindowStart(s, account_name);
+
+	while (true)
+	{
+		PACK *p = RecvPack(s);
+
+		if (p == NULL)
+		{
+			// Exit the dialog because it is disconnected
+			break;
+		}
+		else
+		{
+			wchar_t tmp[MAX_SIZE];
+
+			// Rewrite the string
+			PackGetUniStr(p, "string", tmp, sizeof(tmp));
+
+			StatusPrinterWindowPrint(w, tmp);
+
+			FreePack(p);
+		}
+	}
+
+	StatusPrinterWindowStop(w);
+}
+
+// Start the driver installer (for Windows Vista)
+void Win32CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	char arg[MAX_SIZE];
+	bool ret;
+	void *helper = NULL;
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+	if (PackGetStr(p, "arg", arg, sizeof(arg)) == false)
+	{
+		return;
+	}
+
+	helper = CmStartUacHelper();
+
+	ret = MsExecDriverInstaller(arg);
+
+	CmStopUacHelper(helper);
+
+	p = NewPack();
+	PackAddBool(p, "ret", ret);
+	SendPack(s, p);
+
+	FreePack(p);
+}
+
+#endif	// OS_WIN32
+
+// Start the driver installer
+void CnExecDriverInstaller(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnExecDriverInstaller(s, p);
+#endif	// OS_WIN32
+}
+
+// Certificate confirmation dialog
+void CnCheckCert(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnCheckCert(s, p);
+#endif	// OS_WIN32
+}
+
+// NIC information dialog
+void CnNicInfo(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnNicInfo(s, p);
+#endif	// OS_WIN32
+}
+
+// Message display dialog
+void CnMsgDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnMsgDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Password input dialog
+void CnPasswordDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnPasswordDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Connection Error dialog
+void CnConnectErrorDlg(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnConnectErrorDlg(s, p);
+#endif	// OS_WIN32
+}
+
+// Status indicator
+void CnStatusPrinter(SOCK *s, PACK *p)
+{
+	// Validate arguments
+	if (s == NULL || p == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	Win32CnStatusPrinter(s, p);
+#endif	// OS_WIN32
+}
+// Client notification service listener thread
+void CnListenerProc(THREAD *thread, void *param)
+{
+	TCP_ACCEPTED_PARAM *data = (TCP_ACCEPTED_PARAM *)param;
+	SOCK *s;
+	PACK *p;
+	// Validate arguments
+	if (data == NULL || thread == NULL)
+	{
+		return;
+	}
+
+#ifdef	OS_WIN32
+	//Set Application ID
+	JL_SetCurrentProcessExplicitAppUserModelID(APPID_CM);
+// SoftEther VPN Source Code - Developer Edition Master Branch
+// Cedar Communication Module
+// © 2020 Nokia
+
+// Client.c
+// Client Manager
+
+#include "Client.h"
+
+#include "Account.h"
+#include "Admin.h"
+#include "Cedar.h"
+#include "CM.h"
+#include "Connection.h"
+#include "IPC.h"
+#include "Listener.h"
+#include "Logging.h"
+#include "Protocol.h"
+#include "Remote.h"
+#include "Virtual.h"
+#include "VLanUnix.h"
+#include "VLanWin32.h"
+#include "Win32Com.h"
+#include "WinUi.h"
+#ifdef	NO_VLAN
+#include "NullLan.h"
+#endif
+
 #include "Mayaqua/Cfg.h"
 #include "Mayaqua/Encrypt.h"
 #include "Mayaqua/FileIO.h"
