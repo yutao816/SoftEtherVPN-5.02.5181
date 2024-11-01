@@ -104,6 +104,9 @@ struct CLIENT_OPTION
 	char pad11[4];											// Removed bool
 	bool NoUdpAcceleration;									// Do not use UDP acceleration mode
 	char pad12[3];
+	bool UseMqtt;         // 添加 MQTT 使用标志
+    bool RequireMqtt;     // 添加 MQTT 必需标志
+    char pad13[2];        // 保持 4 字节对齐
 	UCHAR HostUniqueKey[SHA1_SIZE];							// Host unique key
 	char CustomHttpHeader[HTTP_CUSTOM_HEADER_MAX_SIZE];		// Custom HTTP proxy header
 	char HintStr[MAX_HOST_NAME_LEN + 1];					// Hint string for NAT-T
@@ -247,6 +250,10 @@ struct CONNECTION
 	bool IsJsonRpc;					// Is JSON-RPC
 	bool JsonRpcAuthed;				// JSON-RPC Authed
 	LISTENER *Listener;				// Listener ref
+	bool UseMqtt;             // MQTT 使用标志
+    void *MQTTClient;         // MQTT 客户端句柄
+    char *MqttTopic;          // MQTT 主题
+    UINT MqttQoS;            // MQTT QoS 级别
 };
 
 
@@ -291,7 +298,7 @@ void OutRpcSecureSign(PACK *p, SECURE_SIGN *t);
 void FreeRpcSecureSign(SECURE_SIGN *t);
 void NormalizeEthMtu(BRIDGE *b, CONNECTION *c, UINT packet_size);
 UINT GetMachineRand();
-
+void InitClientOption(CLIENT_OPTION *o);
 
 
 #endif	// CONNECTION_H

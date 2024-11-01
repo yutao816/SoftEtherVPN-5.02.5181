@@ -6,7 +6,7 @@
 // Connection Manager
 
 #include "Connection.h"
-#include "mqtt_vpn/mqtt_vpn.h"
+#include "../mqtt_vpn/mqtt_vpn.h"
 #include "BridgeUnix.h"
 #include "BridgeWin32.h"
 #include "Hub.h"
@@ -3521,7 +3521,16 @@ CONNECTION *NewServerConnection(CEDAR *cedar, SOCK *s, THREAD *t)
 
 	return c;
 }
-
+void InitClientOption(CLIENT_OPTION *o)
+{
+    // ... existing initialization ...
+    
+    // 初始化 MQTT 相关选项
+    o->UseMqtt = true;        // 默认启用 MQTT
+    o->RequireMqtt = false;   // 默认不强制要求 MQTT
+    
+    // ... rest of initialization ...
+}
 // Creating a Client Connection
 CONNECTION *NewClientConnection(SESSION *s)
 {
@@ -3530,6 +3539,8 @@ CONNECTION *NewClientConnection(SESSION *s)
 CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver, UINT client_build)
 {
     CONNECTION *c;
+
+    Print("Starting NewClientConnectionEx...\n");  // 添加初始调试输出
 
     // 初始化 CONNECTION 对象
     c = ZeroMalloc(sizeof(CONNECTION));
@@ -3548,6 +3559,19 @@ CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver,
     c->CurrentNumConnection = NewCounter();
     c->LastCounterResetTick = Tick64();
     Inc(c->CurrentNumConnection);
+
+    // 初始化 MQTT 相关字段
+    c->UseMqtt = true;        // 设置连接的 MQTT 标志
+    c->MQTTClient = NULL;
+    c->MqttTopic = NULL;
+    c->MqttQoS = 0;
+
+    // 确保 ClientOption 中的 MQTT 标志被设置
+    if (s != NULL && s->ClientOption != NULL)
+    {
+        s->ClientOption->UseMqtt = true;    // 设置 ClientOption 的 MQTT 标志
+        Print("MQTT: ClientOption->UseMqtt set to true\n");
+    }
 
     c->ConnectingThreads = NewList(NULL);
     c->ConnectingSocks = NewList(NULL);
@@ -3589,21 +3613,77 @@ CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver,
     c->SendBlocks = NewQueue();
     c->SendBlocks2 = NewQueue();
 
-    // 尝试初始化 MQTT 连接
-    if (GetMqttUserConfig())  // 获取用户的 MQTT 配置
+    // MQTT 配置和初始化
+    Print("\nMQTT Configuration Check:\n");
+    Print("------------------------\n");
+    
+    // 分别检查条件
+    bool mqtt_config_result = GetMqttUserConfig();
+    bool client_option_valid = (s != NULL && s->ClientOption != NULL);
+    bool mqtt_enabled = (client_option_valid && s->ClientOption->UseMqtt);
+    
+    Print("Condition Check Results:\n");
+    Print("  - GetMqttUserConfig: %d\n", mqtt_config_result);
+    Print("  - Client Option Valid: %d\n", client_option_valid);
+    Print("  - MQTT Enabled: %d\n", mqtt_enabled);
+
+    if (mqtt_config_result && mqtt_enabled)
     {
+        Print("\nMQTT: All conditions passed, proceeding with initialization\n");
         const MQTT_CONFIG* mqtt_config = GetCurrentMqttConfig();
-        if (InitializeMqttConnection(c, mqtt_config->broker, mqtt_config->topic))
+        
+        if (mqtt_config != NULL)
         {
-            Debug("MQTT: Connection initialized successfully for %s", c->Name);
-            c->Protocol = CONNECTION_MQTT;  // 切换到 MQTT 协议
+            Print("MQTT Config Details:\n");
+            Print("  - Broker: %s\n", mqtt_config->broker);
+            Print("  - Topic: %s\n", mqtt_config->topic);
+            Print("  - QoS: %d\n", mqtt_config->qos);
+            
+            if (!IsEmptyStr(mqtt_config->broker))
+            {
+                if (InitializeMqttConnection(c, mqtt_config->broker, mqtt_config->topic))
+                {
+                    Print("MQTT: Connection initialized successfully\n");
+                    c->Protocol = CONNECTION_MQTT;
+                    c->UseMqtt = true;
+                    c->MqttTopic = CopyStr(mqtt_config->topic);
+                    c->MqttQoS = mqtt_config->qos;
+                }
+                else
+                {
+                    Print("MQTT: Connection initialization failed\n");
+                    if (s->ClientOption->RequireMqtt)
+                    {
+                        c->Err = ERR_MQTT_INIT_FAILED;
+                        goto CLEANUP;
+                    }
+                    c->Protocol = CONNECTION_TCP;
+                    c->UseMqtt = false;
+                }
+            }
+            else
+            {
+                Print("MQTT: Empty broker address\n");
+            }
         }
         else
         {
-            Debug("MQTT: Connection initialization failed for %s", c->Name);
-            // 如果 MQTT 初始化失败，保持使用 TCP
+            Print("MQTT: Failed to get configuration\n");
         }
     }
+    else
+    {
+        Print("MQTT: Configuration check failed\n");
+    }
 
+    Print("Connection initialization completed\n");
     return c;
+
+CLEANUP:
+    Print("MQTT: Cleaning up failed connection\n");
+    if (c != NULL)
+    {
+        ReleaseConnection(c);
+    }
+    return NULL;
 }

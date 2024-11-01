@@ -108,6 +108,8 @@ struct CLIENT_OPTION
 	char CustomHttpHeader[HTTP_CUSTOM_HEADER_MAX_SIZE];		// Custom HTTP proxy header
 	char HintStr[MAX_HOST_NAME_LEN + 1];					// Hint string for NAT-T
 	IP   BindLocalIP;										// Source IP address for outgoing connection
+	bool UseMqtt;         // 是否使用 MQTT
+    bool RequireMqtt;     // 是否必须使用 MQTT（失败时不允许回退到TCP）
 	UINT BindLocalPort;										// Source port number for outgoing connection
 };
 

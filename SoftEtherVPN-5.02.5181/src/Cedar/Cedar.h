@@ -7,7 +7,7 @@
 
 #ifndef	CEDAR_H
 #define	CEDAR_H
-
+#define DEBUG    // 确保这个定义存在
 #include "CedarType.h"
 #include "GlobalConst.h"
 
