@@ -19,6 +19,10 @@
 #define	KEEP_ALIVE_STRING				"Internet Connection Keep Alive Packet"
 
 #define	UPDATE_LAST_COMM_TIME(v, n)		{if ((v) <= (n)) { v = (n); } }
+// 连接协议类型
+#define CONNECTION_TCP    0
+#define CONNECTION_UDP    1
+#define CONNECTION_MQTT   2   // 添加MQTT协议类型
 
 // KEEP CONNECT structure
 struct KEEP

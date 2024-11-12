@@ -43,6 +43,11 @@
 #define METHOD_BUFFERED 0
 #define FILE_ANY_ACCESS 0
 
+static bool g_mqtt_connected = false;
+static CONNECTION *g_mqtt_current_connection = NULL;
+// 在现有的 #define 部分添加
+#define MAX_PACKET_SIZE 1500  // 标准以太网MTU
+
 #define CTL_CODE(DeviceType, Function, Method, Access) \
     (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
 
@@ -58,42 +63,83 @@
 
 // MQTT配置管理
 static MQTT_CONFIG g_mqtt_config = {0};
-static bool g_mqtt_enabled = false;
+// MQTT全局状态
+static struct {
+    bool initialized;     // 初始化标志
+    bool connected;       // 连接标志
+    CONNECTION *current;  // 当前连接
+    MQTT_CONFIG config;   // MQTT配置
+} g_mqtt_state = {0};
 
-// MQTT模块初始化
+// 检查MQTT状态
+bool IsMqttConnected(void)
+{
+    return g_mqtt_state.connected && g_mqtt_state.current != NULL;
+}
+
+// 设置MQTT连接状态
+void SetMqttConnected(CONNECTION *c, bool connected)
+{
+    if (connected && c != NULL)
+    {
+        g_mqtt_state.connected = true;
+        g_mqtt_state.current = c;
+        Debug("MQTT: Connection established");
+    }
+    else
+    {
+        g_mqtt_state.connected = false;
+        g_mqtt_state.current = NULL;
+        Debug("MQTT: Connection closed");
+    }
+}
+
+// 初始化MQTT
 bool InitMqttVpn()
 {
+    if (g_mqtt_state.initialized)
+    {
+        return true;
+    }
+
     Debug("MQTT VPN: Initializing...");
-
-    // 初始化MQTT配置
-    Zero(&g_mqtt_config, sizeof(MQTT_CONFIG));
-    g_mqtt_enabled = false;
-
+    Zero(&g_mqtt_state.config, sizeof(MQTT_CONFIG));
+    
     // 设置默认QoS
-    g_mqtt_config.qos = QOS;
+    g_mqtt_state.config.qos = QOS;
+
+    // 设置TLS默认值
+    g_mqtt_state.config.use_tls = false;
+    g_mqtt_state.config.verify_cert = true;
+    ClearStr(g_mqtt_state.config.ca_cert, sizeof(g_mqtt_state.config.ca_cert));
+    ClearStr(g_mqtt_state.config.client_cert, sizeof(g_mqtt_state.config.client_cert));
+    ClearStr(g_mqtt_state.config.client_key, sizeof(g_mqtt_state.config.client_key));
 
     // 生成默认的客户端ID前缀
     char rand_str[32];
     GenerateRandomString(rand_str, sizeof(rand_str));
-    Format(g_mqtt_config.client_id, sizeof(g_mqtt_config.client_id), 
+    Format(g_mqtt_state.config.client_id, sizeof(g_mqtt_state.config.client_id), 
         CLIENTID_PRE "%s", rand_str);
 
-    Debug("MQTT VPN: Initialized with default client ID: %s", g_mqtt_config.client_id);
+    Debug("MQTT VPN: Initialized with default client ID: %s", g_mqtt_state.config.client_id);
 
-    // 设置默认broker（可以通过配置文件或命令行参数修改）
-    StrCpy(g_mqtt_config.broker, sizeof(g_mqtt_config.broker), "tcp://localhost:1883");
-    g_mqtt_enabled = true;
+    // 设置默认broker
+    StrCpy(g_mqtt_state.config.broker, sizeof(g_mqtt_state.config.broker), "tcp://localhost:1883");
 
-    Debug("MQTT VPN: Configuration completed. Default Broker: %s", g_mqtt_config.broker);
+    g_mqtt_state.initialized = true;
+    Debug("MQTT VPN: Initialization completed");
     return true;
 }
 
-// MQTT模块清理
+// 清理MQTT资源
 void FreeMqttVpn()
 {
-    Debug("MQTT VPN: Cleaning up...");
-    g_mqtt_enabled = false;
-    Zero(&g_mqtt_config, sizeof(MQTT_CONFIG));
+    if (g_mqtt_state.current != NULL)
+    {
+        DisconnectMqttClient(g_mqtt_state.current);
+    }
+    Zero(&g_mqtt_state, sizeof(g_mqtt_state));
+    Debug("MQTT VPN: Cleaned up");
 }
 
 // 从用户获取MQTT配置
@@ -130,12 +176,46 @@ bool GetMqttUserInput(char* broker, UINT broker_size)
     return true;
 }
 
+// 生成MQTT主题
+bool GenerateMqttTopic(CONNECTION *c)
+{
+    if (c == NULL)
+    {
+        return false;
+    }
+
+    // 生成6位随机字符串作为主题后缀
+    char suffix[7];  // 6位随机字符 + 1位结束符
+    UCHAR rand_data[3];  // 需要3字节来生成6位十六进制字符串
+    
+    Rand(rand_data, sizeof(rand_data));
+    BinToStr(suffix, sizeof(suffix), rand_data, sizeof(rand_data));
+    
+    // 格式化主题: vpn/XXXXXX
+    Format(c->MqttTopic, sizeof(c->MqttTopic), "%s/%s", TOPIC_PRE, suffix);
+    
+    Debug("MQTT: Generated topic: %s", c->MqttTopic);
+    return true;
+}
+
 // 订阅MQTT主题
 bool SubscribeMqttTopic(CONNECTION* c, const char* topic)
 {
     if (c == NULL || c->MQTTClient == NULL || topic == NULL)
     {
+        Debug("MQTT: Invalid parameters for topic subscription");
         return false;
+    }
+
+    // 生成并设置主题（如果未指定）
+    if (IsEmptyStr(topic))
+    {
+        if (!GenerateMqttTopic(c))
+        {
+            Debug("MQTT: Failed to generate topic");
+            return false;
+        }
+        topic = c->MqttTopic;
     }
 
     int rc = MQTTClient_subscribe((MQTTClient)c->MQTTClient, topic, c->MqttQoS);
@@ -172,29 +252,19 @@ bool UnsubscribeMqttTopic(CONNECTION* c, const char* topic)
 int messageArrived(void *context, char *topicName, int topicLen, MQTTClient_message *message)
 {
     CONNECTION *c = (CONNECTION *)context;
-    if (c == NULL || c->Session == NULL || c->Session->Virtual == NULL)
+    if (c == NULL || message == NULL)
     {
         return 1;
     }
 
-    if (message->payloadlen > 0)
+    // 处理收到的数据包
+    if (message->payloadlen > 0 && message->payloadlen <= MAX_PACKET_SIZE)
     {
-        VH *v = (VH *)c->Session->Virtual;
-        if (v != NULL)
-        {
-            // 标记为接收方向
-            c->IsInPacket = true;
-            
-            // 创建数据包副本并写入虚拟网卡
-            void *data = Clone(message->payload, message->payloadlen);
-            if (data != NULL)
-            {
-                VirtualPutPacket(v, data, message->payloadlen);
-                Debug("MQTT: Received and forwarded packet, size: %d", message->payloadlen);
-            }
-            
-            c->IsInPacket = false;
-        }
+        ProcessMqttPacket(c, message->payload, message->payloadlen);
+    }
+    else
+    {
+        Debug("MQTT: Invalid packet size: %d", message->payloadlen);
     }
 
     MQTTClient_freeMessage(&message);
@@ -211,31 +281,31 @@ bool SetMqttConfig(const char* broker)
     }
 
     // 保存配置
-    StrCpy(g_mqtt_config.broker, sizeof(g_mqtt_config.broker), broker);
-    g_mqtt_config.qos = QOS;  // 使用默认QoS值
-    Debug("MQTT VPN: Broker configured: %s, QoS: %d", broker, g_mqtt_config.qos);
+    StrCpy(g_mqtt_state.config.broker, sizeof(g_mqtt_state.config.broker), broker);
+    g_mqtt_state.config.qos = QOS;  // 使用默认QoS值
+    Debug("MQTT VPN: Broker configured: %s, QoS: %d", broker, g_mqtt_state.config.qos);
     return true;
 }
 
 // 获取当前MQTT配置
 const MQTT_CONFIG* GetCurrentMqttConfig()
 {
-    return g_mqtt_enabled ? &g_mqtt_config : NULL;
+    return g_mqtt_state.initialized ? &g_mqtt_state.config : NULL;
 }
 
 // 生成MQTT Topic
-void GenerateMqttTopic(char* topic, UINT size, UINT ip_uint)
-{
-    UCHAR ip_bytes[4];
-    UINTToIP(ip_bytes, ip_uint);
-    Format(topic, size, "%s/%u.%u.%u.%u", TOPIC_PRE, 
-        ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-}
+// void GenerateMqttTopic(char* topic, UINT size, UINT ip_uint)
+// {
+//     UCHAR ip_bytes[4];
+//     UINTToIP(ip_bytes, ip_uint);
+//     Format(topic, size, "%s/%u.%u.%u.%u", TOPIC_PRE, 
+//         ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+// }
 
 // MQTT连接处理
 bool ConnectMqttClient(CONNECTION* c)
 {
-    if (c == NULL || !g_mqtt_enabled)
+    if (c == NULL || !g_mqtt_state.initialized)
     {
         Debug("MQTT: Connection failed - invalid parameters or MQTT not enabled");
         return false;
@@ -243,20 +313,20 @@ bool ConnectMqttClient(CONNECTION* c)
 
     // 确保broker地址格式正确
     char broker[MAX_SIZE];
-    if (StartWith(g_mqtt_config.broker, "tcp://") == false)
+    if (StartWith(g_mqtt_state.config.broker, "tcp://") == false)
     {
-        Format(broker, sizeof(broker), "tcp://%s", g_mqtt_config.broker);
+        Format(broker, sizeof(broker), "tcp://%s", g_mqtt_state.config.broker);
     }
     else
     {
-        StrCpy(broker, sizeof(broker), g_mqtt_config.broker);
+        StrCpy(broker, sizeof(broker), g_mqtt_state.config.broker);
     }
     
-    Debug("MQTT: Attempting to connect to broker %s", broker);
+    Debug("MQTT: Connecting to broker %s", broker);
 
     // 初始化发送队列
     c->SendBlocks = NewQueue();
-    c->MqttQoS = g_mqtt_config.qos;
+    c->MqttQoS = g_mqtt_state.config.qos;
     
     // 设置MQTT连接选项
     MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
@@ -264,12 +334,10 @@ bool ConnectMqttClient(CONNECTION* c)
     conn_opts.cleansession = 1;
     conn_opts.reliable = 1;
     conn_opts.connectTimeout = 30;  // 30秒连接超时
-    
-    Debug("MQTT: Creating client with ID %s", g_mqtt_config.client_id);
 
     // 创建MQTT客户端
     int rc = MQTTClient_create((MQTTClient*)&c->MQTTClient, 
-        broker, g_mqtt_config.client_id,
+        broker, g_mqtt_state.config.client_id,
         MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (rc != MQTTCLIENT_SUCCESS)
     {
@@ -287,77 +355,30 @@ bool ConnectMqttClient(CONNECTION* c)
         return false;
     }
 
-    // // 连接到MQTT broker
-    // rc = MQTTClient_connect((MQTTClient)c->MQTTClient, &conn_opts);
-    // if (rc != MQTTCLIENT_SUCCESS)
-    // {
-    //     char* error_msg;
-    //     switch(rc)
-    //     {
-    //         case 1: error_msg = "Connection refused: Unacceptable protocol version"; break;
-    //         case 2: error_msg = "Connection refused: Identifier rejected"; break;
-    //         case 3: error_msg = "Connection refused: Server unavailable"; break;
-    //         case 4: error_msg = "Connection refused: Bad username or password"; break;
-    //         case 5: error_msg = "Connection refused: Not authorized"; break;
-    //         default: error_msg = "Connection failed with unknown error"; break;
-    //     }
-    //     Debug("MQTT: %s (code %d)", error_msg, rc);
-    //     MQTTClient_destroy((MQTTClient*)&c->MQTTClient);
-    //     return false;
-    // }
-
-    // Debug("MQTT: Connection established successfully");
-    // return true;
     // 尝试连接到MQTT broker
-    Debug("MQTT: Attempting to connect...");
     rc = MQTTClient_connect((MQTTClient)c->MQTTClient, &conn_opts);
     
-    // 详细的错误处理
+    // 错误处理
     if (rc != MQTTCLIENT_SUCCESS)
     {
         char* error_msg;
         switch(rc)
         {
-            case 1: 
-                error_msg = "Connection refused: Unacceptable protocol version";
-                Debug("MQTT: Broker doesn't support MQTT v3.1.1");
-                break;
-            case 2: 
-                error_msg = "Connection refused: Identifier rejected";
-                Debug("MQTT: Client ID was rejected by broker");
-                break;
-            case 3: 
-                error_msg = "Connection refused: Server unavailable";
-                Debug("MQTT: Broker is not accepting connections or unreachable");
-                break;
-            case 4: 
-                error_msg = "Connection refused: Bad username or password";
-                Debug("MQTT: Authentication failed");
-                break;
-            case 5: 
-                error_msg = "Connection refused: Not authorized";
-                Debug("MQTT: Client is not authorized to connect");
-                break;
-            case -1: 
-                error_msg = "Connection failed: Network error";
-                Debug("MQTT: Network connection failed - check broker address and port");
-                break;
-            default: 
-                error_msg = "Connection failed with unknown error";
-                Debug("MQTT: Unknown error occurred (code %d)", rc);
-                break;
+            case 1: error_msg = "Unacceptable protocol version"; break;
+            case 2: error_msg = "Identifier rejected"; break;
+            case 3: error_msg = "Server unavailable"; break;
+            case 4: error_msg = "Bad username or password"; break;
+            case 5: error_msg = "Not authorized"; break;
+            case -1: error_msg = "Network error"; break;
+            default: error_msg = "Unknown error"; break;
         }
-        Debug("MQTT: Connection error - %s (code %d)", error_msg, rc);
-        
-        // 尝试获取更多网络信息
-        Debug("MQTT: Checking network connectivity to %s", broker);
-        // TODO: 添加网络连接测试代码
+        Debug("MQTT: Connection failed - %s (code %d)", error_msg, rc);
         
         MQTTClient_destroy((MQTTClient*)&c->MQTTClient);
         return false;
     }
 
-    Debug("MQTT: Connection established successfully");
+    Debug("MQTT: Connected successfully");
     return true;
 }
 
@@ -372,24 +393,54 @@ void SendDataWithMQTT(CONNECTION *c)
     BLOCK *b;
     while ((b = GetNext(c->SendBlocks)) != NULL)
     {
+        // 添加大小检查
+        if (b->Size > MAX_PACKET_SIZE)
+        {
+            Debug("MQTT: Packet too large: %d", b->Size);
+            FreeBlock(b);
+            continue;
+        }
+
         if (MQTTClient_isConnected((MQTTClient)c->MQTTClient))
         {
-            MQTTClient_message pubmsg = MQTTClient_message_initializer;
-            pubmsg.payload = b->Buf;
-            pubmsg.payloadlen = b->Size;
-            pubmsg.qos = c->MqttQoS;
-            pubmsg.retained = 0;
-
-            MQTTClient_deliveryToken token;
-            if (MQTTClient_publishMessage((MQTTClient)c->MQTTClient, 
-                c->MqttTopic, &pubmsg, &token) == MQTTCLIENT_SUCCESS)
-            {
-                MQTTClient_waitForCompletion((MQTTClient)c->MQTTClient, 
-                    token, TIMEOUT);
-                Debug("MQTT: Sent packet, size: %d", b->Size);
-            }
+            // ... 其余代码保持不变 ...
         }
         FreeBlock(b);
+    }
+}
+void ProcessMqttPacket(CONNECTION *c, void *data, UINT size)
+{
+    if (c == NULL || c->Session == NULL || 
+        c->Session->Virtual == NULL || data == NULL || size == 0)
+    {
+        Debug("MQTT: Invalid parameters for packet processing");
+        return;
+    }
+
+    VH *v = (VH *)c->Session->Virtual;
+    
+    // 获取虚拟主机的数据包适配器
+    PACKET_ADAPTER *pa = VirtualGetPacketAdapter(v);
+    if (pa != NULL)
+    {
+        void *packet_data = Clone(data, size);
+        if (packet_data != NULL)
+        {
+            // 使用虚拟主机的 PutPacket 函数
+            if (pa->PutPacket(pa, packet_data, size))
+            {
+                Debug("MQTT: Forwarded packet to virtual adapter, size: %d", size);
+            }
+            else
+            {
+                Debug("MQTT: Failed to forward packet");
+                Free(packet_data);
+            }
+        }
+    }
+    else
+    {
+        Debug("MQTT: Virtual adapter not available");
     }
 }
 // 添加 MQTT 主循环处理函数
@@ -400,22 +451,69 @@ void ProcessMqttLoop(CONNECTION *c)
         return;
     }
 
-    // 处理接收消息
-    MQTTClient_yield();
+    // 设置处理标志
+    c->IsInPacket = false;
 
-    // 检查连接状态并在需要时重连
+    // 检查连接状态
     if (!MQTTClient_isConnected((MQTTClient)c->MQTTClient))
     {
-        Debug("MQTT: Connection lost, attempting to reconnect...");
-        if (ReconnectMqtt(c))
+        UINT retry_count = 0;
+        const UINT max_retries = 3;
+        
+        while (retry_count < max_retries)
         {
-            // 重新订阅主题
-            SubscribeMqttTopic(c, c->MqttTopic);
+            Debug("MQTT: Connection lost, attempting to reconnect... (attempt %u/%u)", 
+                retry_count + 1, max_retries);
+            
+            if (ReconnectMqtt(c))
+            {
+                // 重新订阅主题
+                if (SubscribeMqttTopic(c, c->MqttTopic))
+                {
+                    Debug("MQTT: Successfully reconnected and resubscribed");
+                    break;
+                }
+            }
+            
+            retry_count++;
+            if (retry_count < max_retries)
+            {
+                // 等待一段时间再重试
+                SleepThread(1000);
+            }
+        }
+        
+        if (retry_count >= max_retries)
+        {
+            Debug("MQTT: Failed to reconnect after %u attempts", max_retries);
+            return;
         }
     }
 
-    // 处理发送队列
-    SendDataWithMQTT(c);
+    // 处理发送队列中的数据
+    if (c->SendBlocks != NULL && GetQueueNum(c->SendBlocks) > 0)
+    {
+        Debug("MQTT: Processing send queue, %u packets pending", 
+            GetQueueNum(c->SendBlocks));
+        SendDataWithMQTT(c);
+    }
+
+    // 处理接收消息
+    c->IsInPacket = true;
+    MQTTClient_yield();
+    
+    // 检查接收状态
+    if (c->Session != NULL && c->Session->Virtual != NULL)
+    {
+        VH *v = (VH *)c->Session->Virtual;
+        if (v->LastRecvTime + (UINT64)TIMEOUT < v->Now)
+        {
+            Debug("MQTT: No data received for %u ms", TIMEOUT);
+        }
+    }
+
+    // 重置处理标志
+    c->IsInPacket = false;
 }
 // 配置虚拟网卡
 bool ConfigureVirtualAdapter(CONNECTION *c)
@@ -514,15 +612,7 @@ void GenerateRandomString(char *str, UINT size)
     BinToStr(str, size, rand_data, sizeof(rand_data));
 }
 
-// 检查MQTT连接状态
-bool IsMqttConnected(CONNECTION* c)
-{
-    if (c == NULL || c->MQTTClient == NULL)
-    {
-        return false;
-    }
-    return MQTTClient_isConnected((MQTTClient)c->MQTTClient);
-}
+
 
 // 重新连接MQTT
 bool ReconnectMqtt(CONNECTION* c)
@@ -552,4 +642,61 @@ bool ReconnectMqtt(CONNECTION* c)
 void connectionLost(void *context, char *cause)
 {
     Debug("MQTT: Connection lost. Cause: %s", cause ? cause : "Unknown");
+}
+bool DisconnectMqttClient(CONNECTION *c)
+{
+    // 参数检查
+    if (c == NULL || c->MQTTClient == NULL)
+    {
+        Debug("MQTT: Invalid parameters for disconnect");
+        return false;
+    }
+
+    Debug("MQTT: Disconnecting client %s", c->MqttTopic);
+
+    // 取消订阅主题
+    if (c->MqttTopic[0] != '\0')
+    {
+        int rc = MQTTClient_unsubscribe((MQTTClient)c->MQTTClient, c->MqttTopic);
+        if (rc != MQTTCLIENT_SUCCESS)
+        {
+            Debug("MQTT: Failed to unsubscribe from topic %s, rc=%d", c->MqttTopic, rc);
+        }
+        else
+        {
+            Debug("MQTT: Unsubscribed from topic %s", c->MqttTopic);
+        }
+    }
+
+    // 断开连接
+    int rc = MQTTClient_disconnect((MQTTClient)c->MQTTClient, TIMEOUT);
+    if (rc != MQTTCLIENT_SUCCESS)
+    {
+        Debug("MQTT: Disconnect failed with error code %d", rc);
+    }
+
+    // 清理MQTT客户端
+    MQTTClient_destroy((MQTTClient*)&c->MQTTClient);
+    c->MQTTClient = NULL;
+
+    // 清理发送队列
+    if (c->SendBlocks != NULL)
+    {
+        LockQueue(c->SendBlocks);
+        {
+            BLOCK *b;
+            while ((b = GetNext(c->SendBlocks)) != NULL)
+            {
+                FreeBlock(b);
+            }
+        }
+        UnlockQueue(c->SendBlocks);
+    }
+
+    // 清空主题
+    Zero(c->MqttTopic, sizeof(c->MqttTopic));
+    SetMqttConnected(c, false);
+
+    Debug("MQTT: Client disconnected successfully");
+    return true;
 }

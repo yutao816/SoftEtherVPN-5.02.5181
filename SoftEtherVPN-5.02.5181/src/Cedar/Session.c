@@ -19,7 +19,7 @@
 #include "Server.h"
 #include "UdpAccel.h"
 #include "VLanUnix.h"
-
+#include "../mqtt_vpn/mqtt_vpn.h"
 #include "Mayaqua/Internat.h"
 #include "Mayaqua/Kernel.h"
 #include "Mayaqua/Mayaqua.h"
@@ -62,23 +62,12 @@ void SessionMain(SESSION *s)
 	bool lock_receive_blocks_queue = false;
 	UINT static_ip = 0;
 
-	// 添加MQTT数据处理
-     if (s->Connection->Protocol == CONNECTION_MQTT)
+	// 添加MQTT处理
+    if (s->Connection != NULL && s->Connection->Protocol == CONNECTION_MQTT)
     {
-        // 处理发送队列中的数据
-        ConnectionSend(s->Connection, Tick64());
-
-        // 处理接收到的数据
-        BLOCK *b;
-        while ((b = GetNext(s->Connection->ReceivedBlocks)) != NULL)
-        {
-            if (s->Virtual != NULL)
-            {
-                VirtualPutPacket(s->Virtual, b->Buf, b->Size);
-            }
-            FreeBlock(b);
-        }
+        ProcessMqttLoop(s->Connection);
     }
+
 
 	// Validate arguments
 	if (s == NULL)

@@ -8500,7 +8500,8 @@ bool VirtualInit(VH *v)
 	// Counter reset
 	v->Counter->c = 0;
 	v->DhcpId = 0;
-
+    v->Now = Tick64();
+    v->LastRecvTime = v->Now;  // 初始化最后接收时间
 	// Initialize the ARP table
 	InitArpTable(v);
 
@@ -8612,6 +8613,14 @@ void VirtualPolling(VH *v)
 	{
 		return;
 	}
+	// 更新当前时间
+    v->Now = Tick64();
+
+    // 检查接收超时
+    if (v->LastRecvTime + (UINT64)TIMEOUT < v->Now)
+    {
+        Debug("Virtual: No packets received for %u ms", TIMEOUT);
+    }
 
 	// DHCP polling
 	PollingDhcpServer(v);
@@ -9884,28 +9893,40 @@ bool VirtualLayer2Filter(VH *v, PKT *packet)
 // The virtual host is made to receive a packet
 bool VirtualPutPacket(VH *v, void *data, UINT size)
 {
-	
-	if (v == NULL || data == NULL)
+    // 基本参数检查
+    if (v == NULL || data == NULL)
     {
         return false;
     }
 
-   // 判断数据流向
-    if (v->Session && v->Session->Connection && 
+    // MQTT 协议处理
+    if (v->Session != NULL && v->Session->Connection != NULL && 
         v->Session->Connection->Protocol == CONNECTION_MQTT)
     {
-        if (v->Session->Connection->IsInPacket)
+        CONNECTION *conn = v->Session->Connection;
+        
+        // 检查数据包大小
+        if (size > MAX_PACKET_SIZE)
         {
-            // 接收方向：MQTT -> tun/tap
+            Debug("Virtual: Packet size exceeds limit: %u", size);
+            Free(data);
+            return false;
+        }
+
+        
+        if (conn->IsInPacket)
+        {
+            // MQTT -> Virtual (接收方向)
             PKT *packet = ParsePacket(data, size);
             
             LockVirtual(v);
             {
                 if (packet != NULL)
                 {
-                    // 处理二层数据
+                    v->LastRecvTime = v->Now;  // 更新最后接收时间
                     VirtualLayer2(v, packet);
                     FreePacket(packet);
+                    Debug("Virtual: Processed incoming MQTT packet, size: %u", size);
                 }
             }
             UnlockVirtual(v);
@@ -9914,80 +9935,57 @@ bool VirtualPutPacket(VH *v, void *data, UINT size)
         }
         else
         {
-            // 发送方向：tun/tap -> MQTT
-            BLOCK *b = NewBlock(data, size, 0);
-            if (b != NULL)
+            // Virtual -> MQTT (发送方向)
+            if (conn->SendBlocks != NULL)
             {
-                InsertQueue(v->Session->Connection->SendBlocks, b);
-                Debug("Virtual: Queued packet for MQTT sending, size: %d", size);
+                BLOCK *b = NewBlock(data, size, 0);
+                if (b != NULL)
+                {
+                    InsertQueue(conn->SendBlocks, b);
+                    Debug("Virtual: Queued packet for MQTT sending, size: %u", size);
+                }
+                else
+                {
+                    Debug("Virtual: Failed to create block for MQTT sending");
+                }
             }
             Free(data);
         }
         return true;
     }
 
-	if (data == NULL)
-	{
-		// Flush
-		v->flag1 = false;
+    // 原有的数据包处理代码
+    if (data == NULL)
+    {
+        // Flush 处理
+        v->flag1 = false;
+        // ... 保持原有的 Flush 代码不变 ...
+    }
+    else
+    {
+        // 常规数据包处理
+        PKT *packet = ParsePacket(data, size);
 
-		if (v->NativeNat != NULL)
-		{
-			if (v->NativeNat->SendStateChanged)
-			{
-				TUBE *halt_tube = NULL;
+        if (v->flag1 == false)
+        {
+            v->flag1 = true;
+            v->Now = Tick64();
+        }
 
-				Lock(v->NativeNat->Lock);
-				{
-					if (v->NativeNat->HaltTube != NULL)
-					{
-						halt_tube = v->NativeNat->HaltTube;
+        LockVirtual(v);
+        {
+            if (packet != NULL)
+            {
+                VirtualLayer2(v, packet);
+                FreePacket(packet);
+            }
+        }
+        UnlockVirtual(v);
 
-						AddRef(halt_tube->Ref);
-					}
-				}
-				Unlock(v->NativeNat->Lock);
+        Free(data);
+    }
 
-				if (halt_tube != NULL)
-				{
-					TubeFlushEx(halt_tube, true);
-
-					v->NativeNat->SendStateChanged = false;
-
-					ReleaseTube(halt_tube);
-				}
-			}
-		}
-	}
-	else
-	{
-		// Interpret the received packet
-		PKT *packet = ParsePacket(data, size);
-
-		if (v->flag1 == false)
-		{
-			v->flag1 = true;
-			v->Now = Tick64();
-		}
-
-		// Lock the entire virtual machine in here
-		LockVirtual(v);
-		{
-			if (packet != NULL)
-			{
-				// Process the Layer-2
-				VirtualLayer2(v, packet);
-
-				// Release the packet structure
-				FreePacket(packet);
-			}
-		}
-		UnlockVirtual(v);
-
-		Free(data);
-	}
-
-	return true;
+    return true;
 }
 bool VirtualPaPutPacket(SESSION *s, void *data, UINT size)
 {

@@ -311,7 +311,7 @@ struct VH
 	bool IcmpRawSocketOk;			// ICMP RAW SOCKET is available
 	bool IcmpApiOk;					// ICMP API is available
 	HUB_OPTION *HubOption;			// Pointer to the Virtual HUB options
-
+    UINT64 LastRecvTime;
 	NATIVE_NAT *NativeNat;			// Native NAT
 };
 

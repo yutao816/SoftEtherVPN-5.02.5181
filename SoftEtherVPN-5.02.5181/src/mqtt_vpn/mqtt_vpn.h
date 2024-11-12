@@ -38,6 +38,11 @@ typedef struct MQTT_CONFIG
     char broker[MAX_PATH];     // MQTT broker 地址
     char client_id[64];        // MQTT client ID
     int qos;                   // MQTT QoS level
+    bool use_tls;             // 是否使用TLS
+    char ca_cert[MAX_PATH];    // CA证书路径
+    char client_cert[MAX_PATH];// 客户端证书路径
+    char client_key[MAX_PATH]; // 客户端私钥路径
+    bool verify_cert;          // 是否验证服务器证书
 } MQTT_CONFIG;
 
 // 函数声明
@@ -45,18 +50,25 @@ void connectionLost(void *context, char *cause);
 const MQTT_CONFIG* GetCurrentMqttConfig();
 bool ConnectMqttClient(CONNECTION* c);
 void ProcessMqttLoop(CONNECTION *c);
-void GenerateMqttTopic(char* topic, UINT size, UINT ip_uint);
 void SendDataWithMQTT(CONNECTION *c);
 void ProcessMqttMessages(CONNECTION *c);
 void CleanupMqttConnection(CONNECTION *c);
 void GenerateRandomString(char *str, UINT size);
 bool InitMqttVpn();
+bool IsMqttConnected(void);
 void FreeMqttVpn();
+bool IsMqttInitialized(void);
+void SetMqttConnected(CONNECTION *c, bool connected);
+bool IsMqttEnabled(void);
 bool ConfigureVirtualAdapter(CONNECTION *c);
 bool GetMqttUserInput(char* broker, UINT broker_size);
 bool SubscribeMqttTopic(CONNECTION* c, const char* topic);
 bool UnsubscribeMqttTopic(CONNECTION* c, const char* topic);
-bool IsMqttConnected(CONNECTION* c);
+void SetMqttConnectionStatus(CONNECTION *c, bool is_connected);
 bool ReconnectMqtt(CONNECTION* c);
 bool SetMqttConfig(const char* broker);
+void ProcessMqttPacket(CONNECTION *c, void *data, UINT size);
+bool DisconnectMqttClient(CONNECTION* c);
+bool GenerateMqttTopic(CONNECTION *c);
+bool DisconnectMqttClient(CONNECTION *c);
 #endif // MQTT_VPN_H

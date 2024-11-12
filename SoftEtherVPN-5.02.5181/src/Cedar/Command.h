@@ -37,6 +37,7 @@
 #define CMD_MqttConnect_Connecting     "Connecting to MQTT broker..."
 #define CMD_MqttConnect_Success        "Successfully connected via MQTT"
 #define CMD_MqttConnect_Info           "Connected to MQTT broker: %s"
+// 在 Command.h 中添加标志
 
 // Traffic test results
 struct TT_RESULT
@@ -379,6 +380,8 @@ UINT PcAccountServerCertGet(CONSOLE *c, char *cmd_name, wchar_t *str, void *para
 UINT PcAccountDetailSet(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountRename(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 
+UINT PcMqttDisconnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
+// UINT PcMqttStatus(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountDisconnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
