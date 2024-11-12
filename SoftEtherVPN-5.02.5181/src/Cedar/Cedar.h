@@ -879,6 +879,13 @@
 #define ERR_SSL_SHARED_CIPHER			151 // Can't find common cipher
 #define ERR_SSL_HANDSHAKE				152 // Other SSL handshake error
 
+// 添加协议类型定义
+#define CONNECTION_TCP  0
+#define CONNECTION_MQTT 1
+// MQTT相关错误码
+#define ERR_MQTT_INIT_FAILED          200   // MQTT初始化失败
+#define ERR_MQTT_CONNECT_FAILED       201   // MQTT连接失败
+#define ERR_MQTT_SUBSCRIBE_FAILED     202   // MQTT订阅失败
 
 ////////////////////////////
 // Generally used structure

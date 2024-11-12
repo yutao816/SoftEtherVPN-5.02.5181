@@ -9884,6 +9884,48 @@ bool VirtualLayer2Filter(VH *v, PKT *packet)
 // The virtual host is made to receive a packet
 bool VirtualPutPacket(VH *v, void *data, UINT size)
 {
+	
+	if (v == NULL || data == NULL)
+    {
+        return false;
+    }
+
+   // 判断数据流向
+    if (v->Session && v->Session->Connection && 
+        v->Session->Connection->Protocol == CONNECTION_MQTT)
+    {
+        if (v->Session->Connection->IsInPacket)
+        {
+            // 接收方向：MQTT -> tun/tap
+            PKT *packet = ParsePacket(data, size);
+            
+            LockVirtual(v);
+            {
+                if (packet != NULL)
+                {
+                    // 处理二层数据
+                    VirtualLayer2(v, packet);
+                    FreePacket(packet);
+                }
+            }
+            UnlockVirtual(v);
+            
+            Free(data);
+        }
+        else
+        {
+            // 发送方向：tun/tap -> MQTT
+            BLOCK *b = NewBlock(data, size, 0);
+            if (b != NULL)
+            {
+                InsertQueue(v->Session->Connection->SendBlocks, b);
+                Debug("Virtual: Queued packet for MQTT sending, size: %d", size);
+            }
+            Free(data);
+        }
+        return true;
+    }
+
 	if (data == NULL)
 	{
 		// Flush

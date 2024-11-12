@@ -9,7 +9,7 @@
 #define	SESSION_H
 
 #include "Cedar.h"
-
+#include "Virtual.h"  // 添加这行
 // Interval to increment the number of logins after the connection
 #define	NUM_LOGIN_INCREMENT_INTERVAL		(30 * 1000)
 
@@ -75,6 +75,9 @@ struct SESSION
 	LOCK *lock;						// Lock
 	REF *ref;						// Reference counter
 	CEDAR *Cedar;					// Cedar
+	VIRTUAL *Virtual;                // 添加 Virtual 字段
+	bool UseMqtt;           // 是否使用MQTT
+    bool RequireMqtt;       // 是否必须使用MQTT
 	bool LocalHostSession;			// Local host session
 	bool ServerMode;				// Server mode session
 	bool NormalClient;				// Connecting session from a regular client (not such as localbridge)

@@ -32,6 +32,11 @@
 #define	VPNCMD_BOOTSTRAP_REG_VALUENAME_PATH	"InstalledPath"
 #define	VPNCMD_BOOTSTRAP_FILENAME		"|vpncmdsys.exe"
 
+#define CMD_MqttConnect_Init_Failed    "Failed to initialize MQTT VPN module."
+#define CMD_MqttConnect_Config_Failed  "Failed to configure MQTT settings."
+#define CMD_MqttConnect_Connecting     "Connecting to MQTT broker..."
+#define CMD_MqttConnect_Success        "Successfully connected via MQTT"
+#define CMD_MqttConnect_Info           "Connected to MQTT broker: %s"
 
 // Traffic test results
 struct TT_RESULT
@@ -373,6 +378,8 @@ UINT PcAccountServerCertDelete(CONSOLE *c, char *cmd_name, wchar_t *str, void *p
 UINT PcAccountServerCertGet(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountDetailSet(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountRename(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
+
+UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountDisconnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountStatusGet(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);

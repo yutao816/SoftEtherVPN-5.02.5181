@@ -250,10 +250,12 @@ struct CONNECTION
 	bool JsonRpcAuthed;				// JSON-RPC Authed
 	LISTENER *Listener;				// Listener ref
 	bool UseMqtt;                   // Flag to indicate if MQTT is used
-    char *MqttTopic;                // MQTT topic
-    int MqttQoS;                    // MQTT Quality of Service
-    void *MQTTClient; 
-	
+	void *MQTTClient;                  // MQTT客户端句柄
+    char MqttTopic[MAX_PATH];          // MQTT主题
+    UINT MqttQoS;                      // MQTT QoS级别
+    bool IsMqttEnabled;
+	bool IsInPacket;                        // 标识数据包方向：true=接收数据包，false=发送数据包
+	// QUEUE* SendBlocks;        // 发送队列
 };
 
 

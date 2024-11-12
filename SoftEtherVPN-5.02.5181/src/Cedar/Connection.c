@@ -1444,6 +1444,7 @@ SEND_START:
 	else if (c->UseMqtt)
     {
         SendDataWithMQTT(c);
+        return;
     }
 	else if (c->Protocol == CONNECTION_HUB_SECURE_NAT)
 	{
@@ -2391,6 +2392,7 @@ DISCONNECT_THIS_TCP:
 	else if (c->Protocol == CONNECTION_MQTT)
     {
         ProcessMqttMessages(c);
+        return;
     }
 
 	else if (c->Protocol == CONNECTION_HUB_SECURE_NAT)
@@ -3476,7 +3478,7 @@ CONNECTION *NewServerConnection(CEDAR *cedar, SOCK *s, THREAD *t)
 	c->ref = NewRef();
 	c->Cedar = cedar;
 	c->UseMqtt = false;
-    c->MqttTopic = NULL;
+    Zero(c->MqttTopic, sizeof(c->MqttTopic));  // 使用Zero函数初始化字符数组
     c->MqttQoS = 0;
 	AddRef(c->Cedar->ref);
 	c->Protocol = CONNECTION_TCP;
@@ -3539,19 +3541,26 @@ CONNECTION *NewClientConnection(SESSION *s)
 CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver, UINT client_build)
 {
     CONNECTION *c;
+    // 参数验证
+    if (s == NULL)
+    {
+        return NULL;
+    }
 
-    Print("Starting NewClientConnectionEx...\n");  // 添加初始调试输出
-
-    // 初始化 CONNECTION 对象
+    // 初始化基本连接对象
     c = ZeroMalloc(sizeof(CONNECTION));
     c->ConnectedTick = Tick64();
     c->lock = NewLock();
     c->ref = NewRef();
     c->Cedar = s->Cedar;
     AddRef(c->Cedar->ref);
-    c->Protocol = CONNECTION_TCP;  // 默认使用 TCP
+    
+    // 默认使用TCP协议
+    c->Protocol = CONNECTION_TCP;
     c->Tcp = ZeroMalloc(sizeof(TCP));
     c->Tcp->TcpSockList = NewList(NULL);
+    
+    // 基本设置
     c->ServerMode = false;
     c->Status = CONNECTION_STATUS_CONNECTING;
     c->Name = CopyStr("CLIENT_CONNECTION");
@@ -3560,37 +3569,19 @@ CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver,
     c->LastCounterResetTick = Tick64();
     Inc(c->CurrentNumConnection);
 
-    // 初始化 MQTT 相关字段
-    c->UseMqtt = true;        // 设置连接的 MQTT 标志
-    c->MQTTClient = NULL;
-    c->MqttTopic = NULL;
-    c->MqttQoS = 0;
-
-    // 确保 ClientOption 中的 MQTT 标志被设置
-    if (s != NULL && s->ClientOption != NULL)
-    {
-        s->ClientOption->UseMqtt = true;    // 设置 ClientOption 的 MQTT 标志
-        Print("MQTT: ClientOption->UseMqtt set to true\n");
-    }
-
+    // 创建连接列表
     c->ConnectingThreads = NewList(NULL);
     c->ConnectingSocks = NewList(NULL);
 
+    // 设置客户端信息
     if (client_str == NULL)
     {
         c->ClientVer = s->Cedar->Version;
         c->ClientBuild = s->Cedar->Build;
-
         if (c->Session->VirtualHost == false)
         {
-            if (c->Session->LinkModeClient == false)
-            {
-                StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_CLIENT_STR);
-            }
-            else
-            {
-                StrCpy(c->ClientStr, sizeof(c->ClientStr), CEDAR_SERVER_LINK_STR);
-            }
+            StrCpy(c->ClientStr, sizeof(c->ClientStr), 
+                c->Session->LinkModeClient ? CEDAR_SERVER_LINK_STR : CEDAR_CLIENT_STR);
         }
         else
         {
@@ -3604,86 +3595,27 @@ CONNECTION *NewClientConnectionEx(SESSION *s, char *client_str, UINT client_ver,
         StrCpy(c->ClientStr, sizeof(c->ClientStr), client_str);
     }
 
-    // 服务器名称和端口号
+    // 设置服务器信息
     StrCpy(c->ServerName, sizeof(c->ServerName), s->ClientOption->Hostname);
     c->ServerPort = s->ClientOption->Port;
 
-    // 创建队列
+    // 创建数据队列
     c->ReceivedBlocks = NewQueue();
     c->SendBlocks = NewQueue();
     c->SendBlocks2 = NewQueue();
 
-    // MQTT 配置和初始化
-    Print("\nMQTT Configuration Check:\n");
-    Print("------------------------\n");
-    
-    // 分别检查条件
-    bool mqtt_config_result = GetMqttUserConfig();
-    bool client_option_valid = (s != NULL && s->ClientOption != NULL);
-    bool mqtt_enabled = (client_option_valid && s->ClientOption->UseMqtt);
-    
-    Print("Condition Check Results:\n");
-    Print("  - GetMqttUserConfig: %d\n", mqtt_config_result);
-    Print("  - Client Option Valid: %d\n", client_option_valid);
-    Print("  - MQTT Enabled: %d\n", mqtt_enabled);
-
-    if (mqtt_config_result && mqtt_enabled)
+    // MQTT 初始化
+    if (s->ClientOption != NULL && s->ClientOption->UseMqtt)
     {
-        Print("\nMQTT: All conditions passed, proceeding with initialization\n");
-        const MQTT_CONFIG* mqtt_config = GetCurrentMqttConfig();
-        
-        if (mqtt_config != NULL)
+        c->Protocol = CONNECTION_MQTT;
+        if (!ConnectMqttClient(c))
         {
-            Print("MQTT Config Details:\n");
-            Print("  - Broker: %s\n", mqtt_config->broker);
-            Print("  - Topic: %s\n", mqtt_config->topic);
-            Print("  - QoS: %d\n", mqtt_config->qos);
-            
-            if (!IsEmptyStr(mqtt_config->broker))
-            {
-                if (InitializeMqttConnection(c, mqtt_config->broker, mqtt_config->topic))
-                {
-                    Print("MQTT: Connection initialized successfully\n");
-                    c->Protocol = CONNECTION_MQTT;
-                    c->UseMqtt = true;
-                    c->MqttTopic = CopyStr(mqtt_config->topic);
-                    c->MqttQoS = mqtt_config->qos;
-                }
-                else
-                {
-                    Print("MQTT: Connection initialization failed\n");
-                    if (s->ClientOption->RequireMqtt)
-                    {
-                        c->Err = ERR_MQTT_INIT_FAILED;
-                        goto CLEANUP;
-                    }
-                    c->Protocol = CONNECTION_TCP;
-                    c->UseMqtt = false;
-                }
-            }
-            else
-            {
-                Print("MQTT: Empty broker address\n");
-            }
+            Debug("MQTT: Connection failed in NewClientConnectionEx");
+            ReleaseConnection(c);
+            return NULL;
         }
-        else
-        {
-            Print("MQTT: Failed to get configuration\n");
-        }
-    }
-    else
-    {
-        Print("MQTT: Configuration check failed\n");
+        Debug("MQTT: Connection established in NewClientConnectionEx");
     }
 
-    Print("Connection initialization completed\n");
     return c;
-
-CLEANUP:
-    Print("MQTT: Cleaning up failed connection\n");
-    if (c != NULL)
-    {
-        ReleaseConnection(c);
-    }
-    return NULL;
 }

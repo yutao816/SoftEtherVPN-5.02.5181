@@ -1,7 +1,12 @@
 // SoftEther VPN Source Code - Developer Edition Master Branch
 // Mayaqua Kernel
 
+
+// Network.c
+// Network communication module
+
 #include "Network.h"
+
 #include "Cfg.h"
 #include "DNS.h"
 #include "FileIO.h"
@@ -17,848 +22,1477 @@
 #include "Unix.h"
 
 #include <string.h>
+
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-// 添加 MQTT 库
-#include <MQTTClient.h>
+#ifdef OS_UNIX
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <signal.h>
 
-// MQTT 相关定义
-#define ADDRESS     "tcp://mqtt.eclipse.org:1883"
-#define CLIENTID    "SoftEtherVPN_Client"
-#define QOS         1
-#define TIMEOUT     10000L
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#endif
 
-static MQTTClient mqtt_client;
-static MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+#ifdef UNIX_MACOS
+#include <sys/event.h>
+#endif
 
-// 初始化 MQTT 客户端
-void InitMQTT()
+#ifdef UNIX
+#ifdef UNIX_SOLARIS
+#define USE_STATVFS
+#include <sys/statvfs.h>
+#else
+#define MAYAQUA_SUPPORTS_GETIFADDRS
+#include <ifaddrs.h>
+#endif
+#endif
+
+#ifdef OS_WIN32
+#include <iphlpapi.h>
+#include <WS2tcpip.h>
+#include <wincrypt.h>
+#include <IcmpAPI.h>
+
+struct ROUTE_CHANGE_DATA
 {
-    int rc;
-    MQTTClient_create(&mqtt_client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
-    conn_opts.keepAliveInterval = 20;
-    conn_opts.cleansession = 1;
+	HANDLE Handle;
+	UINT NumCalled;
+	bool Changed;
+};
+#endif
 
-    if ((rc = MQTTClient_connect(mqtt_client, &conn_opts)) != MQTTCLIENT_SUCCESS)
-    {
-        Debug("Failed to connect to MQTT broker, return code %d\n", rc);
-        return;
-    }
-    Debug("Connected to MQTT broker\n");
+// Whether the blocking occurs in SSL
+#if	defined(UNIX_BSD) || defined(UNIX_MACOS)
+#define	FIX_SSL_BLOCKING
+#endif
+
+// HTTP constant
+static char http_detect_server_startwith[] = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\r\n<HTML><HEAD>\r\n<TITLE>403 Forbidden</TITLE>\r\n</HEAD><BODY>\r\n<H1>Forbidden</H1>\r\nYou don't have permission to access ";
+static char http_detect_server_tag_future[] = "9C37197CA7C2428388C2E6E59B829B30";
+
+// Lock related
+static LOCK *machine_name_lock = NULL;
+static LOCK *disconnect_function_lock = NULL;
+extern LOCK *openssl_lock;
+static COUNTER *num_tcp_connections = NULL;
+static LOCK *unix_dns_server_addr_lock = NULL;
+static IP unix_dns_server;
+static LIST *WaitThreadList = NULL;
+static UCHAR machine_ip_process_hash[SHA1_SIZE];
+static LOCK *machine_ip_process_hash_lock = NULL;
+static LOCK *current_global_ip_lock = NULL;
+static LOCK *current_fqdn_lock = NULL;
+static bool current_global_ip_set = false;
+static IP current_glocal_ipv4 = {0};
+static IP current_glocal_ipv6 = {0};
+static char current_fqdn[MAX_SIZE];
+static bool g_no_rudp_server = false;
+static bool g_no_rudp_register = false;
+static bool g_natt_low_priority = false;
+static LOCK *host_ip_address_list_cache_lock = NULL;
+static UINT64 host_ip_address_list_cache_last = 0;
+static LIST *host_ip_address_cache = NULL;
+static bool disable_gethostname_by_accept = false;
+
+
+static LIST *ip_clients = NULL;
+
+static LIST *local_mac_list = NULL;
+static LOCK *local_mac_list_lock = NULL;
+
+static UINT rand_port_numbers[256] = {0};
+
+
+static bool g_use_privateip_file = false;
+static bool g_source_ip_validation_force_disable = false;
+
+static DH_CTX *dh_param = NULL;
+
+typedef struct PRIVATE_IP_SUBNET
+{
+	UINT Ip, Mask, Ip2;
+} PRIVATE_IP_SUBNET;
+
+static LIST *g_private_ip_list = NULL;
+
+
+static LIST *g_dyn_value_list = NULL;
+
+
+
+//#define	RUDP_DETAIL_LOG
+
+
+
+
+// Get a value from a dynamic value list (Returns a default value if the value is not found)
+UINT64 GetDynValueOrDefault(char *name, UINT64 default_value, UINT64 min_value, UINT64 max_value)
+{
+	UINT64 ret = GetDynValue(name);
+
+	if (ret == 0)
+	{
+		return default_value;
+	}
+
+	if (ret < min_value)
+	{
+		ret = min_value;
+	}
+
+	if (ret > max_value)
+	{
+		ret = max_value;
+	}
+
+	return ret;
 }
 
-// 清理 MQTT 客户端
-void CleanupMQTT()
+// Get a value from a dynamic value list (Returns a default value if the value is not found)
+// The value is limited to 1/5 to 50 times of the default value for safety
+UINT64 GetDynValueOrDefaultSafe(char *name, UINT64 default_value)
 {
-    MQTTClient_disconnect(mqtt_client, 10000);
-    MQTTClient_destroy(&mqtt_client);
+	return GetDynValueOrDefault(name, default_value, default_value / (UINT64)5, default_value * (UINT64)50);
 }
 
-// 修改 SendTo 函数以使用 MQTT 发布消息
-UINT SendTo(SOCK *sock, IP *dest_addr, UINT dest_port, void *data, UINT size)
+// Get a value from a dynamic value list
+UINT64 GetDynValue(char *name)
 {
-    char topic[256];
-    sprintf(topic, "SoftEtherVPN/%s/%u", IPToStr(dest_addr), dest_port);
+	UINT64 ret = 0;
+	// Validate arguments
+	if (name == NULL)
+	{
+		return 0;
+	}
 
-    MQTTClient_message pubmsg = MQTTClient_message_initializer;
-    MQTTClient_deliveryToken token;
-    
-    pubmsg.payload = data;
-    pubmsg.payloadlen = size;
-    pubmsg.qos = QOS;
-    pubmsg.retained = 0;
+	if (g_dyn_value_list == NULL)
+	{
+		return 0;
+	}
 
-    int rc = MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, &token);
-    if (rc != MQTTCLIENT_SUCCESS)
-    {
-        Debug("Failed to publish message, return code %d\n", rc);
-        return 0;
-    }
+	LockList(g_dyn_value_list);
+	{
+		UINT i;
 
-    rc = MQTTClient_waitForCompletion(mqtt_client, token, TIMEOUT);
-    if (rc != MQTTCLIENT_SUCCESS)
-    {
-        Debug("Message delivery failed, return code %d\n", rc);
-        return 0;
-    }
+		for (i = 0; i < LIST_NUM(g_dyn_value_list); i++)
+		{
+			DYN_VALUE *vv = LIST_DATA(g_dyn_value_list, i);
 
-    return size;
+			if (StrCmpi(vv->Name, name) == 0)
+			{
+				ret = vv->Value;
+				break;
+			}
+		}
+	}
+	UnlockList(g_dyn_value_list);
+
+	return ret;
 }
 
-// 修改 RecvFrom 函数以使用 MQTT 订阅消息
-UINT RecvFrom(SOCK *sock, IP *src_addr, UINT *src_port, void *data, UINT size)
+// Set the value to the dynamic value list
+void SetDynListValue(char *name, UINT64 value)
 {
-    char topic[256];
-    sprintf(topic, "SoftEtherVPN/%s/+", IPToStr(&sock->LocalIP));
+	// Validate arguments
+	if (name == NULL)
+	{
+		return;
+	}
 
-    int rc = MQTTClient_subscribe(mqtt_client, topic, QOS);
-    if (rc != MQTTCLIENT_SUCCESS)
-    {
-        Debug("Failed to subscribe to topic, return code %d\n", rc);
-        return 0;
-    }
+	if (g_dyn_value_list == NULL)
+	{
+		return;
+	}
 
-    MQTTClient_message *message = NULL;
-    char *received_topic = NULL;
-    int received = MQTTClient_receive(mqtt_client, &received_topic, &message, TIMEOUT);
-    
-    if (received == MQTTCLIENT_SUCCESS && message)
-    {
-        UINT recv_size = MIN(size, message->payloadlen);
-        memcpy(data, message->payload, recv_size);
-        
-        // 解析源地址和端口
-        char *last_slash = strrchr(received_topic, '/');
-        if (last_slash)
-        {
-            *src_port = (UINT)strtoul(last_slash + 1, NULL, 10);
-            *last_slash = '\0';
-            StrToIP(src_addr, received_topic + strlen("SoftEtherVPN/"));
-        }
+	LockList(g_dyn_value_list);
+	{
+		UINT i;
+		DYN_VALUE *v = NULL;
 
-        MQTTClient_freeMessage(&message);
-        MQTTClient_free(received_topic);
-        
-        return recv_size;
-    }
+		for (i = 0; i < LIST_NUM(g_dyn_value_list); i++)
+		{
+			DYN_VALUE *vv = LIST_DATA(g_dyn_value_list, i);
 
-    return 0;
+			if (StrCmpi(vv->Name, name) == 0)
+			{
+				v = vv;
+				break;
+			}
+		}
+
+		if (v == NULL)
+		{
+			v = ZeroMalloc(sizeof(DYN_VALUE));
+			StrCpy(v->Name, sizeof(v->Name), name);
+
+			Add(g_dyn_value_list, v);
+		}
+
+		v->Value = value;
+	}
+	UnlockList(g_dyn_value_list);
 }
 
-// 其他函数保持不变...
-
-// 修改 InitNetwork 函数以初始化 MQTT
-void InitNetwork()
+// Apply by extracting dynamic value list from the specified PACK
+void ExtractAndApplyDynList(PACK *p)
 {
-    // 原有的初始化代码...
+	BUF *b;
+	// Validate arguments
+	if (p == NULL)
+	{
+		return;
+	}
 
-    InitMQTT();
+	b = PackGetBuf(p, "DynList");
+	if (b == NULL)
+	{
+		return;
+	}
+
+	AddDynList(b);
+
+	FreeBuf(b);
 }
 
-// 修改 FreeNetwork 函数以清理 MQTT
-void FreeNetwork()
+// Insert the data to the dynamic value list
+void AddDynList(BUF *b)
 {
-    // 原有的清理代码...
+	PACK *p;
+	TOKEN_LIST *t;
+	// Validate arguments
+	if (b == NULL)
+	{
+		return;
+	}
 
-    CleanupMQTT();
+	SeekBufToBegin(b);
+
+	p = BufToPack(b);
+	if (p == NULL)
+	{
+		return;
+	}
+
+	t = GetPackElementNames(p);
+	if (t != NULL)
+	{
+		UINT i;
+
+		for (i = 0; i < t->NumTokens; i++)
+		{
+			char *name = t->Token[i];
+			UINT64 v = PackGetInt64(p, name);
+
+			SetDynListValue(name, v);
+		}
+
+		FreeToken(t);
+	}
+
+	FreePack(p);
 }
 
-// 其他函数和代码保持不变...
+// Initialization of the dynamic value list
+void InitDynList()
+{
+	g_dyn_value_list = NewList(NULL);
+}
+
+// Solution of dynamic value list
+void FreeDynList()
+{
+	UINT i;
+	if (g_dyn_value_list == NULL)
+	{
+		return;
+	}
+
+	for (i = 0; i < LIST_NUM(g_dyn_value_list); i++)
+	{
+		DYN_VALUE *d = LIST_DATA(g_dyn_value_list, i);
+
+		Free(d);
+	}
+
+	ReleaseList(g_dyn_value_list);
+
+	g_dyn_value_list = NULL;
+}
+
+// Disable NAT-T function globally
+void DisableRDUPServerGlobally()
+{
+	g_no_rudp_server = true;
+}
+
+// Get the current time zone
+int GetCurrentTimezone()
+{
+	int ret = 0;
+
+#ifdef	OS_WIN32
+	ret = GetCurrentTimezoneWin32();
+#else	// OS_WIN32
+	{
+#if	defined(UNIX_MACOS) || defined(UNIX_BSD)
+		struct timeval tv;
+		struct timezone tz;
+
+		Zero(&tv, sizeof(tv));
+		Zero(&tz, sizeof(tz));
+
+		gettimeofday(&tv, &tz);
+
+		ret = tz.tz_minuteswest;
+
+#else	// defined(UNIX_MACOS) || defined(UNIX_BSD)
+		tzset();
+
+		ret = timezone / 60;
+#endif	// defined(UNIX_MACOS) || defined(UNIX_BSD)
+	}
+#endif	// OS_WIN32
+
+	return ret;
+}
+
+// Flag of whether to use an alternate host name
+bool IsUseAlternativeHostname()
+{
+
+	return false;
+}
+
+#ifdef	OS_WIN32
+// Get the current time zone (Win32)
+int GetCurrentTimezoneWin32()
+{
+	TIME_ZONE_INFORMATION info;
+	Zero(&info, sizeof(info));
+
+	if (GetTimeZoneInformation(&info) == TIME_ZONE_ID_INVALID)
+	{
+		return 0;
+	}
+
+	return info.Bias;
+}
+#endif	// OS_WIN32
+
+
+// Set the current FQDN of the DDNS
+void SetCurrentDDnsFqdn(char *name)
+{
+	// Validate arguments
+	if (name == NULL)
+	{
+		return;
+	}
+
+	Lock(current_fqdn_lock);
+	{
+		StrCpy(current_fqdn, sizeof(current_fqdn), name);
+	}
+	Unlock(current_fqdn_lock);
+}
+
+// Get the current DDNS FQDN hash
+UINT GetCurrentDDnsFqdnHash()
+{
+	UINT ret;
+	UCHAR hash[SHA1_SIZE];
+	char name[MAX_SIZE];
+
+	ClearStr(name, sizeof(name));
+	GetCurrentDDnsFqdn(name, sizeof(name));
+
+	Trim(name);
+	StrUpper(name);
+
+	Sha1(hash, name, StrLen(name));
+
+	Copy(&ret, hash, sizeof(UINT));
+
+	return ret;
+}
+
+// Get the current DDNS FQDN
+void GetCurrentDDnsFqdn(char *name, UINT size)
+{
+	ClearStr(name, size);
+	// Validate arguments
+	if (name == NULL || size == 0)
+	{
+		return;
+	}
+
+	Lock(current_fqdn_lock);
+	{
+		StrCpy(name, size, current_fqdn);
+	}
+	Unlock(current_fqdn_lock);
+
+	Trim(name);
+}
+
+// Check whether the specified MAC address exists on the local host (high speed)
+bool IsMacAddressLocalFast(void *addr)
+{
+	bool ret = false;
+	// Validate arguments
+	if (addr == NULL)
+	{
+		return false;
+	}
+
+	Lock(local_mac_list_lock);
+	{
+		if (local_mac_list == NULL)
+		{
+			// First enumeration
+			RefreshLocalMacAddressList();
+		}
+
+		ret = IsMacAddressLocalInner(local_mac_list, addr);
+	}
+	Unlock(local_mac_list_lock);
+
+	return ret;
+}
+
+// Update the local MAC address list
+void RefreshLocalMacAddressList()
+{
+	Lock(local_mac_list_lock);
+	{
+		if (local_mac_list != NULL)
+		{
+			FreeNicList(local_mac_list);
+		}
+
+		local_mac_list = GetNicList();
+	}
+	Unlock(local_mac_list_lock);
+}
+
+// Check whether the specified MAC address exists on the local host
+bool IsMacAddressLocalInner(LIST *o, void *addr)
+{
+	bool ret = false;
+	UINT i;
+	// Validate arguments
+	if (o == NULL || addr == NULL)
+	{
+		return false;
+	}
+
+	for (i = 0; i < LIST_NUM(o); i++)
+	{
+		NIC_ENTRY *e = LIST_DATA(o, i);
+
+		if (Cmp(e->MacAddress, addr, 6) == 0)
+		{
+			ret = true;
+			break;
+		}
+	}
+
+	return ret;
+}
+
+// Get a list of the NICs on the computer
+LIST *GetNicList()
+{
+	LIST *o = NULL;
+
+#ifdef	OS_WIN32
+	o = Win32GetNicList();
+
+	if (o != NULL)
+	{
+		return o;
+	}
+
+#endif	// OS_WIN32
+
+	return NewListFast(NULL);
+}
+
+#ifdef	OS_WIN32
+LIST *Win32GetNicList()
+{
+	UINT i;
+	LIST *o = NewListFast(NULL);
+	MS_ADAPTER_LIST *al = MsCreateAdapterList();
+
+	if (al == NULL)
+	{
+		return NULL;
+	}
+
+	for (i = 0; i < al->Num; i++)
+	{
+		MS_ADAPTER *a = al->Adapters[i];
+
+		if (a->Type == 6 && a->AddressSize == 6)
+		{
+			NIC_ENTRY *e = ZeroMalloc(sizeof(NIC_ENTRY));
+
+			StrCpy(e->IfName, sizeof(e->IfName), a->Title);
+			Copy(e->MacAddress, a->Address, 6);
+
+			Add(o, e);
+		}
+	}
+
+	MsFreeAdapterList(al);
+
+	return o;
+}
+#endif	// OS_WIN32
+
+// Release the NIC list
+void FreeNicList(LIST *o)
+{
+	UINT i;
+	// Validate arguments
+	if (o == NULL)
+	{
+		return;
+	}
+
+	for (i = 0; i < LIST_NUM(o); i++)
+	{
+		NIC_ENTRY *e = LIST_DATA(o, i);
+
+		Free(e);
+	}
+
+	ReleaseList(o);
+}
+
+// If the computer is connected to the FLET'S line currently, detect the type of the line (obsolete)
+UINT DetectFletsType()
+{
+	UINT ret = 0;
+	//LIST *o = GetHostIPAddressList();
+//	UINT i;
+
+	/*
+		for (i = 0;i < LIST_NUM(o);i++)
+		{
+			IP *ip = LIST_DATA(o, i);
+
+			if (IsIP6(ip))
+			{
+				char ip_str[MAX_SIZE];
+
+				IPToStr(ip_str, sizeof(ip_str), ip);
+
+				if (IsInSameNetwork6ByStr(ip_str, "2001:c90::", "/32"))
+				{
+					// NTT East B-FLETs
+					ret |= FLETS_DETECT_TYPE_EAST_BFLETS_PRIVATE;
+				}
+
+				if (IsInSameNetwork6ByStr(ip_str, "2408:200::", "/23"))
+				{
+					// Wrapping in network of NTT East NGN
+					ret |= FLETS_DETECT_TYPE_EAST_NGN_PRIVATE;
+				}
+
+				if (IsInSameNetwork6ByStr(ip_str, "2001:a200::", "/23"))
+				{
+					// Wrapping in network of NTT West NGN
+					ret |= FLETS_DETECT_TYPE_WEST_NGN_PRIVATE;
+				}
+			}
+		}
+
+		FreeHostIPAddressList(o);
+	*/
+	return ret;
+}
+
+// Query for the IP address using the DNS proxy for the B FLETs
+bool GetIPViaDnsProxyForJapanFlets(IP *ip_ret, char *hostname, bool ipv6, UINT timeout, bool *cancel, char *dns_proxy_hostname)
+{
+	SOCK *s;
+	char connect_hostname[MAX_SIZE];
+	char connect_hostname2[MAX_SIZE];
+	IP dns_proxy_ip;
+	bool ret = false;
+	bool dummy_flag = false;
+	char request_str[512];
+	// Validate arguments
+	if (ip_ret == NULL || hostname == NULL)
+	{
+		return false;
+	}
+	if (timeout == 0)
+	{
+		timeout = BFLETS_DNS_PROXY_TIMEOUT_FOR_QUERY;
+	}
+	if (cancel == NULL)
+	{
+		cancel = &dummy_flag;
+	}
+
+	// Get the IP address of the DNS proxy server
+	if (IsEmptyStr(dns_proxy_hostname))
+	{
+		// B FLETs
+		if (GetDnsProxyIPAddressForJapanBFlets(&dns_proxy_ip, BFLETS_DNS_PROXY_TIMEOUT_FOR_GET_F, cancel) == false)
+		{
+			return false;
+		}
+	}
+	else
+	{
+		// FLET'S NEXT
+		if (GetIP6Ex(&dns_proxy_ip, dns_proxy_hostname, FLETS_NGN_DNS_QUERY_TIMEOUT, cancel) == false)
+		{
+			return false;
+		}
+	}
+
+	if (*cancel)
+	{
+		return false;
+	}
+
+	IPToStr(connect_hostname, sizeof(connect_hostname), &dns_proxy_ip);
+
+	/*{
+		StrCpy(connect_hostname, sizeof(connect_hostname), "2409:250:62c0:100:6a05:caff:fe09:5158");
+	}*/
+
+	StrCpy(connect_hostname2, sizeof(connect_hostname2), connect_hostname);
+	if (IsIP6(&dns_proxy_ip))
+	{
+		Format(connect_hostname2, sizeof(connect_hostname2), "[%s]", connect_hostname);
+	}
+
+	s = ConnectEx3(connect_hostname, BFLETS_DNS_PROXY_PORT, timeout, cancel, NULL, NULL, false, false);
+
+	if (s == NULL)
+	{
+		return false;
+	}
+
+	if (*cancel)
+	{
+		Disconnect(s);
+		ReleaseSock(s);
+
+		return false;
+	}
+
+	SetTimeout(s, timeout);
+
+	// Start the SSL
+	if (StartSSLEx(s, NULL, NULL, 0, NULL) && (*cancel == false))
+	{
+		UCHAR hash[SHA1_SIZE];
+		BUF *hash2 = StrToBin(BFLETS_DNS_PROXY_CERT_HASH);
+
+		Zero(hash, sizeof(hash));
+		GetXDigest(s->RemoteX, hash, true);
+
+		if (Cmp(hash, hash2->Buf, SHA1_SIZE) == 0)
+		{
+			// Send the HTTP Request
+			Format(request_str, sizeof(request_str),
+			       "GET " BFLETS_DNS_PROXY_PATH "?q=%s&ipv6=%u\r\n"
+			       "\r\n",
+			       hostname, ipv6, connect_hostname2);
+
+			if (SendAll(s, request_str, StrLen(request_str), true))
+			{
+				if (*cancel == false)
+				{
+					BUF *recv_buf = NewBuf();
+					UINT port_ret;
+
+					while (true)
+					{
+						UCHAR tmp[MAX_SIZE];
+						UINT r;
+
+						r = Recv(s, tmp, sizeof(tmp), true);
+
+						if (r == 0 || (recv_buf->Size > 65536))
+						{
+							break;
+						}
+						else
+						{
+							WriteBuf(recv_buf, tmp, r);
+						}
+					}
+
+					ret = RUDPParseIPAndPortStr(recv_buf->Buf, recv_buf->Size, ip_ret, &port_ret);
+
+					FreeBuf(recv_buf);
+				}
+			}
+		}
+
+		FreeBuf(hash2);
+	}
+
+	Disconnect(s);
+	ReleaseSock(s);
+
+	if (ret)
+	{
+		DnsCacheUpdate(hostname, ipv6 ? ip_ret : NULL, ipv6 ? NULL : ip_ret);
+	}
+
+	return ret;
+}
 
 // Get the IP address of the available DNS proxy in B-FLET'S service that is provided by NTT East of Japan
 bool GetDnsProxyIPAddressForJapanBFlets(IP *ip_ret, UINT timeout, bool *cancel)
 {
-    char topic[256];
-    sprintf(topic, "SoftEtherVPN/%s/%u", IPToStr(dest_addr), dest_port);
+	BUF *b;
+	LIST *o;
+	bool ret = false;
+	// Validate arguments
+	if (ip_ret == NULL)
+	{
+		return false;
+	}
+	if (timeout == 0)
+	{
+		timeout = BFLETS_DNS_PROXY_TIMEOUT_FOR_GET_F;
+	}
 
-    MQTTClient_message pubmsg = MQTTClient_message_initializer;
-    MQTTClient_deliveryToken token;
-    
-    pubmsg.payload = data;
-    pubmsg.payloadlen = size;
-    pubmsg.qos = QOS;
-    pubmsg.retained = 0;
+	b = QueryFileByUdpForJapanBFlets(timeout, cancel);
 
-    int rc = MQTTClient_publishMessage(mqtt_client, topic, &pubmsg, &token);
-    if (rc != MQTTCLIENT_SUCCESS)
-    {
-        Debug("Failed to publish message, return code %d\n", rc);
-        return 0;
-    }
+	if (b == NULL)
+	{
+		return false;
+	}
 
-    rc = MQTTClient_waitForCompletion(mqtt_client, token, TIMEOUT);
-    if (rc != MQTTCLIENT_SUCCESS)
-    {
-        Debug("Message delivery failed, return code %d\n", rc);
-        return 0;
-    }
+	o = ReadIni(b);
 
-    return size;
+	if (o != NULL)
+	{
+		INI_ENTRY *e = GetIniEntry(o, "DDnsServerForBFlets");
+
+		if (e != NULL)
+		{
+			char *s = e->Value;
+
+			if (IsEmptyStr(s) == false)
+			{
+				IP ip;
+
+				if (StrToIP(&ip, s))
+				{
+					if (IsZeroIp(&ip) == false)
+					{
+						Copy(ip_ret, &ip, sizeof(IP));
+						ret = true;
+					}
+				}
+			}
+		}
+	}
+
+	FreeIni(o);
+	FreeBuf(b);
+
+	return ret;
 }
 
 // Get a valid F.txt file in B-FLET'S service that is provided by NTT East of Japan
 BUF *QueryFileByUdpForJapanBFlets(UINT timeout, bool *cancel)
 {
-    bool dummy_flag = false;
-    BUF *txt_buf = NULL;
-    BUF *ret = NULL;
-    LIST *ip_list = NULL;
-    UINT i;
-    // Validate arguments
-    if (cancel == NULL)
-    {
-        cancel = &dummy_flag;
-    }
-    if (timeout == 0)
-    {
-        timeout = BFLETS_DNS_PROXY_TIMEOUT_FOR_GET_F;
-    }
+	bool dummy_flag = false;
+	BUF *txt_buf = NULL;
+	BUF *ret = NULL;
+	LIST *ip_list = NULL;
+	UINT i;
+	// Validate arguments
+	if (cancel == NULL)
+	{
+		cancel = &dummy_flag;
+	}
+	if (timeout == 0)
+	{
+		timeout = BFLETS_DNS_PROXY_TIMEOUT_FOR_GET_F;
+	}
 
-    txt_buf = ReadDump(UDP_FILE_QUERY_BFLETS_TXT_FILENAME);
-    if (txt_buf == NULL)
-    {
-        return NULL;
-    }
+	txt_buf = ReadDump(UDP_FILE_QUERY_BFLETS_TXT_FILENAME);
+	if (txt_buf == NULL)
+	{
+		return NULL;
+	}
 
-    ip_list = NewListFast(NULL);
+	ip_list = NewListFast(NULL);
 
-    while (true)
-    {
-        char *line = CfgReadNextLine(txt_buf);
-        if (line == NULL)
-        {
-            break;
-        }
+	while (true)
+	{
+		char *line = CfgReadNextLine(txt_buf);
+		if (line == NULL)
+		{
+			break;
+		}
 
-        Trim(line);
+		Trim(line);
 
-        if (IsEmptyStr(line) == false && StartWith(line, "#") == false)
-        {
-            IP ip;
+		if (IsEmptyStr(line) == false && StartWith(line, "#") == false)
+		{
+			IP ip;
 
-            if (StrToIP6(&ip, line))
-            {
-                if (IsZeroIp(&ip) == false)
-                {
-                    if (IsIPv6LocalNetworkAddress(&ip) == false)
-                    {
-                        Add(ip_list, Clone(&ip, sizeof(IP)));
-                    }
-                }
-            }
-        }
+			if (StrToIP6(&ip, line))
+			{
+				if (IsZeroIp(&ip) == false)
+				{
+					if (IsIPv6LocalNetworkAddress(&ip) == false)
+					{
+						Add(ip_list, Clone(&ip, sizeof(IP)));
+					}
+				}
+			}
+		}
 
-        Free(line);
-    }
+		Free(line);
+	}
 
-    FreeBuf(txt_buf);
+	FreeBuf(txt_buf);
 
-    ret = QueryFileByIPv6Udp(ip_list, timeout, cancel);
+	ret = QueryFileByIPv6Udp(ip_list, timeout, cancel);
 
-    for (i = 0; i < LIST_NUM(ip_list); i++)
-    {
-        IP *ip = LIST_DATA(ip_list, i);
+	for (i = 0; i < LIST_NUM(ip_list); i++)
+	{
+		IP *ip = LIST_DATA(ip_list, i);
 
-        Free(ip);
-    }
+		Free(ip);
+	}
 
-    ReleaseList(ip_list);
+	ReleaseList(ip_list);
 
-    return ret;
+	return ret;
 }
 
 // Request a file by UDP (send the requests to the multiple IP addresses at the same time)
 BUF *QueryFileByIPv6Udp(LIST *ip_list, UINT timeout, bool *cancel)
 {
-    bool dummy_flag = false;
-    UINT64 start_tick, giveup_tick;
-    UINT64 next_send_tick;
-    SOCK *s;
-    INTERRUPT_MANAGER *interrupt;
-    BUF *buf = NULL;
-    SOCK_EVENT *se;
-    UCHAR *tmp_buf;
-    UINT tmp_buf_size = 65535;
-    // Validate arguments
-    if (cancel == NULL)
-    {
-        cancel = &dummy_flag;
-    }
-    if (ip_list == NULL)
-    {
-        return NULL;
-    }
+	bool dummy_flag = false;
+	UINT64 start_tick, giveup_tick;
+	UINT64 next_send_tick;
+	SOCK *s;
+	INTERRUPT_MANAGER *interrupt;
+	BUF *buf = NULL;
+	SOCK_EVENT *se;
+	UCHAR *tmp_buf;
+	UINT tmp_buf_size = 65535;
+	// Validate arguments
+	if (cancel == NULL)
+	{
+		cancel = &dummy_flag;
+	}
+	if (ip_list == NULL)
+	{
+		return NULL;
+	}
 
-    s = NewUDP6(0, NULL);
-    if (s == NULL)
-    {
-        return NULL;
-    }
+	s = NewUDP6(0, NULL);
+	if (s == NULL)
+	{
+		return NULL;
+	}
 
-    tmp_buf = Malloc(tmp_buf_size);
+	tmp_buf = Malloc(tmp_buf_size);
 
-    start_tick = Tick64();
-    giveup_tick = start_tick + (UINT64)timeout;
-    next_send_tick = 0;
+	start_tick = Tick64();
+	giveup_tick = start_tick + (UINT64)timeout;
+	next_send_tick = 0;
 
-    interrupt = NewInterruptManager();
+	interrupt = NewInterruptManager();
 
-    AddInterrupt(interrupt, giveup_tick);
+	AddInterrupt(interrupt, giveup_tick);
 
-    se = NewSockEvent();
-    JoinSockToSockEvent(s, se);
+	se = NewSockEvent();
+	JoinSockToSockEvent(s, se);
 
-    while (true)
-    {
-        UINT64 now = Tick64();
+	while (true)
+	{
+		UINT64 now = Tick64();
 
-        if (now >= giveup_tick)
-        {
-            // Time-out
-            break;
-        }
+		if (now >= giveup_tick)
+		{
+			// Time-out
+			break;
+		}
 
-        if (*cancel)
-        {
-            // User canceled
-            break;
-        }
+		if (*cancel)
+		{
+			// User canceled
+			break;
+		}
 
-        // Receive
-        while (true)
-        {
-            IP src_ip;
-            UINT src_port;
-            UINT r;
+		// Receive
+		while (true)
+		{
+			IP src_ip;
+			UINT src_port;
+			UINT r;
 
-            r = RecvFrom(s, &src_ip, &src_port, tmp_buf, tmp_buf_size);
+			r = RecvFrom(s, &src_ip, &src_port, tmp_buf, tmp_buf_size);
 
-            if (r == SOCK_LATER || r == 0)
-            {
-                break;
-            }
+			if (r == SOCK_LATER || r == 0)
+			{
+				break;
+			}
 
-            if (src_port == UDP_FILE_QUERY_DST_PORT)
-            {
-                if (r >= 40)
-                {
-                    if (Cmp(tmp_buf, UDP_FILE_QUERY_MAGIC_NUMBER, StrLen(UDP_FILE_QUERY_MAGIC_NUMBER)) == 0)
-                    {
-                        // Successful reception
-                        buf = NewBuf();
-                        WriteBuf(buf, tmp_buf, r);
-                        SeekBuf(buf, 0, 0);
-                        break;
-                    }
-                }
-            }
-        }
+			if (src_port == UDP_FILE_QUERY_DST_PORT)
+			{
+				if (r >= 40)
+				{
+					if (Cmp(tmp_buf, UDP_FILE_QUERY_MAGIC_NUMBER, StrLen(UDP_FILE_QUERY_MAGIC_NUMBER)) == 0)
+					{
+						// Successful reception
+						buf = NewBuf();
+						WriteBuf(buf, tmp_buf, r);
+						SeekBuf(buf, 0, 0);
+						break;
+					}
+				}
+			}
+		}
 
-        if (buf != NULL)
-        {
-            // Successful reception
-            break;
-        }
+		if (buf != NULL)
+		{
+			// Successful reception
+			break;
+		}
 
-        if (next_send_tick == 0 || (now >= next_send_tick))
-        {
-            // Transmission
-            UINT i;
-            for (i = 0; i < LIST_NUM(ip_list); i++)
-            {
-                IP *ip = LIST_DATA(ip_list, i);
-                UCHAR c = 'F';
+		if (next_send_tick == 0 || (now >= next_send_tick))
+		{
+			// Transmission
+			UINT i;
+			for (i = 0; i < LIST_NUM(ip_list); i++)
+			{
+				IP *ip = LIST_DATA(ip_list, i);
+				UCHAR c = 'F';
 
-                SendTo(s, ip, UDP_FILE_QUERY_DST_PORT, &c, 1);
-            }
+				SendTo(s, ip, UDP_FILE_QUERY_DST_PORT, &c, 1);
+			}
 
-            next_send_tick = now + (UINT64)UDP_FILE_QUERY_RETRY_INTERVAL;
-            AddInterrupt(interrupt, next_send_tick);
-        }
+			next_send_tick = now + (UINT64)UDP_FILE_QUERY_RETRY_INTERVAL;
+			AddInterrupt(interrupt, next_send_tick);
+		}
 
-        WaitSockEvent(se, GetNextIntervalForInterrupt(interrupt));
-    }
+		WaitSockEvent(se, GetNextIntervalForInterrupt(interrupt));
+	}
 
-    FreeInterruptManager(interrupt);
+	FreeInterruptManager(interrupt);
 
-    Disconnect(s);
-    ReleaseSock(s);
+	Disconnect(s);
+	ReleaseSock(s);
 
-    ReleaseSockEvent(se);
+	ReleaseSockEvent(se);
 
-    Free(tmp_buf);
+	Free(tmp_buf);
 
-    return buf;
+	return buf;
 }
 
 // Parse the user name of the NT
 void ParseNtUsername(char *src_username, char *dst_username, UINT dst_username_size, char *dst_domain, UINT dst_domain_size, bool do_not_parse_atmark)
 {
-    char tmp_username[MAX_SIZE];
-    char tmp_domain[MAX_SIZE];
-    TOKEN_LIST *t;
+	char tmp_username[MAX_SIZE];
+	char tmp_domain[MAX_SIZE];
+	TOKEN_LIST *t;
 
-    if (src_username != dst_username)
-    {
-        ClearStr(dst_username, dst_username_size);
-    }
+	if (src_username != dst_username)
+	{
+		ClearStr(dst_username, dst_username_size);
+	}
 
-    ClearStr(dst_domain, dst_domain_size);
-    // Validate arguments
-    if (src_username == NULL || dst_username == NULL || dst_domain == NULL)
-    {
-        return;
-    }
+	ClearStr(dst_domain, dst_domain_size);
+	// Validate arguments
+	if (src_username == NULL || dst_username == NULL || dst_domain == NULL)
+	{
+		return;
+	}
 
-    StrCpy(tmp_username, sizeof(tmp_username), src_username);
-    ClearStr(tmp_domain, sizeof(tmp_domain));
+	StrCpy(tmp_username, sizeof(tmp_username), src_username);
+	ClearStr(tmp_domain, sizeof(tmp_domain));
 
-    // Analysis of username@domain.name format
-    if (do_not_parse_atmark == false)
-    {
-        t = ParseTokenWithNullStr(tmp_username, "@");
-        if (t->NumTokens >= 1)
-        {
-            StrCpy(tmp_username, sizeof(tmp_username), t->Token[0]);
-        }
-        if (t->NumTokens >= 2)
-        {
-            StrCpy(tmp_domain, sizeof(tmp_domain), t->Token[1]);
-        }
-        FreeToken(t);
-    }
+	// Analysis of username@domain.name format
+	if (do_not_parse_atmark == false)
+	{
+		t = ParseTokenWithNullStr(tmp_username, "@");
+		if (t->NumTokens >= 1)
+		{
+			StrCpy(tmp_username, sizeof(tmp_username), t->Token[0]);
+		}
+		if (t->NumTokens >= 2)
+		{
+			StrCpy(tmp_domain, sizeof(tmp_domain), t->Token[1]);
+		}
+		FreeToken(t);
+	}
 
-    // If the username part is in "domain\username" format, split it
-    t = ParseTokenWithNullStr(tmp_username, "\\");
-    if (t->NumTokens >= 2)
-    {
-        if (IsEmptyStr(tmp_domain))
-        {
-            StrCpy(tmp_domain, sizeof(tmp_domain), t->Token[0]);
-        }
+	// If the username part is in "domain\username" format, split it
+	t = ParseTokenWithNullStr(tmp_username, "\\");
+	if (t->NumTokens >= 2)
+	{
+		if (IsEmptyStr(tmp_domain))
+		{
+			StrCpy(tmp_domain, sizeof(tmp_domain), t->Token[0]);
+		}
 
-        StrCpy(tmp_username, sizeof(tmp_username), t->Token[1]);
-    }
-    FreeToken(t);
+		StrCpy(tmp_username, sizeof(tmp_username), t->Token[1]);
+	}
+	FreeToken(t);
 
-    StrCpy(dst_username, dst_username_size, tmp_username);
-    StrCpy(dst_domain, dst_domain_size, tmp_domain);
+	StrCpy(dst_username, dst_username_size, tmp_username);
+	StrCpy(dst_domain, dst_domain_size, tmp_domain);
 }
 
 // The calculation of the optimum MSS value for use in TCP/IP packet in the payload of bulk transfer in R-UDP session
 UINT RUDPCalcBestMssForBulk(RUDP_STACK *r, RUDP_SESSION *se)
 {
-    UINT ret;
-    // Validate arguments
-    if (r == NULL || se == NULL)
-    {
-        return 0;
-    }
+	UINT ret;
+	// Validate arguments
+	if (r == NULL || se == NULL)
+	{
+		return 0;
+	}
 
-    ret = MTU_FOR_PPPOE;
+	ret = MTU_FOR_PPPOE;
 
-    // IPv4
-    if (IsIP6(&se->YourIp) == false)
-    {
-        ret -= 20;
-    }
-    else
-    {
-        ret -= 40;
-    }
+	// IPv4
+	if (IsIP6(&se->YourIp) == false)
+	{
+		ret -= 20;
+	}
+	else
+	{
+		ret -= 40;
+	}
 
-    if (r->Protocol == RUDP_PROTOCOL_ICMP)
-    {
-        // ICMP
-        ret -= 8;
+	if (r->Protocol == RUDP_PROTOCOL_ICMP)
+	{
+		// ICMP
+		ret -= 8;
 
-        ret -= SHA1_SIZE;
-    }
-    else if (r->Protocol == RUDP_PROTOCOL_DNS)
-    {
-        // UDP
-        ret -= 8;
+		ret -= SHA1_SIZE;
+	}
+	else if (r->Protocol == RUDP_PROTOCOL_DNS)
+	{
+		// UDP
+		ret -= 8;
 
-        // DNS
-        ret -= 42;
-    }
+		// DNS
+		ret -= 42;
+	}
 
-    // IV
-    ret -= SHA1_SIZE;
+	// IV
+	ret -= SHA1_SIZE;
 
-    // Sign
-    ret -= SHA1_SIZE;
+	// Sign
+	ret -= SHA1_SIZE;
 
-    // SEQ_NO
-    ret -= sizeof(UINT64);
+	// SEQ_NO
+	ret -= sizeof(UINT64);
 
-    // Padding Max
-    ret -= 31;
+	// Padding Max
+	ret -= 31;
 
-    // Ethernet header (target packets of communication)
-    ret -= 14;
+	// Ethernet header (target packets of communication)
+	ret -= 14;
 
-    // IPv4 Header (target packet of communication)
-    ret -= 20;
+	// IPv4 Header (target packet of communication)
+	ret -= 20;
 
-    // TCP header (target packet of communication)
-    ret -= 20;
+	// TCP header (target packet of communication)
+	ret -= 20;
 
-    // I don't know well, but subtract 24 bytes
-    ret -= 24;
+	// I don't know well, but subtract 24 bytes
+	ret -= 24;
 
-    return ret;
+	return ret;
 }
 
 // Processing of the reply packet from the NAT-T server
 void RUDPProcess_NatT_Recv(RUDP_STACK *r, UDPPACKET *udp)
 {
-    BUF *b;
-    PACK *p;
-    // Validate arguments
-    if (r == NULL || udp == NULL)
-    {
-        return;
-    }
+	BUF *b;
+	PACK *p;
+	// Validate arguments
+	if (r == NULL || udp == NULL)
+	{
+		return;
+	}
 
-    if (udp->Size >= 8)
-    {
-        char tmp[128];
+	if (udp->Size >= 8)
+	{
+		char tmp[128];
 
-        Zero(tmp, sizeof(tmp));
-        Copy(tmp, udp->Data, MIN(udp->Size, sizeof(tmp) - 1));
+		Zero(tmp, sizeof(tmp));
+		Copy(tmp, udp->Data, MIN(udp->Size, sizeof(tmp) - 1));
 
-        if (StartWith(tmp, "IP="))
-        {
-            IP my_ip;
-            UINT my_port;
+		if (StartWith(tmp, "IP="))
+		{
+			IP my_ip;
+			UINT my_port;
 
-            // There was a response to the packet to determine the NAT state
-            if (IsEmptyStr(r->NatT_Registered_IPAndPort) == false)
-            {
-                if (StrCmpi(r->NatT_Registered_IPAndPort, tmp) != 0)
-                {
-                    // Redo getting the token and registration because the NAT state is changed
-                    ClearStr(r->NatT_Registered_IPAndPort, sizeof(r->NatT_Registered_IPAndPort));
+			// There was a response to the packet to determine the NAT state
+			if (IsEmptyStr(r->NatT_Registered_IPAndPort) == false)
+			{
+				if (StrCmpi(r->NatT_Registered_IPAndPort, tmp) != 0)
+				{
+					// Redo getting the token and registration because the NAT state is changed
+					ClearStr(r->NatT_Registered_IPAndPort, sizeof(r->NatT_Registered_IPAndPort));
 
-                    r->NatT_GetTokenNextTick = 0;
-                    r->NatT_GetTokenFailNum = 0;
-                    r->NatT_Token_Ok = false;
-                    Zero(r->NatT_Token, sizeof(r->NatT_Token));
+					r->NatT_GetTokenNextTick = 0;
+					r->NatT_GetTokenFailNum = 0;
+					r->NatT_Token_Ok = false;
+					Zero(r->NatT_Token, sizeof(r->NatT_Token));
 
-                    r->NatT_RegisterNextTick = 0;
-                    r->NatT_RegisterFailNum = 0;
-                    r->NatT_Register_Ok = false;
-                }
-            }
+					r->NatT_RegisterNextTick = 0;
+					r->NatT_RegisterFailNum = 0;
+					r->NatT_Register_Ok = false;
+				}
+			}
 
-            if (RUDPParseIPAndPortStr(udp->Data, udp->Size, &my_ip, &my_port))
-            {
-                if (r->NatTGlobalUdpPort != NULL)
-                {
-                    *r->NatTGlobalUdpPort = my_port;
-                }
-            }
+			if (RUDPParseIPAndPortStr(udp->Data, udp->Size, &my_ip, &my_port))
+			{
+				if (r->NatTGlobalUdpPort != NULL)
+				{
+					*r->NatTGlobalUdpPort = my_port;
+				}
+			}
 
-            return;
-        }
-    }
+			return;
+		}
+	}
 
-    // Interpret the UDP packet
-    b = NewBuf();
-    WriteBuf(b, udp->Data, udp->Size);
-    SeekBuf(b, 0, 0);
+	// Interpret the UDP packet
+	b = NewBuf();
+	WriteBuf(b, udp->Data, udp->Size);
+	SeekBuf(b, 0, 0);
 
-    p = BufToPack(b);
+	p = BufToPack(b);
 
-    if (p != NULL)
-    {
-        bool is_ok = PackGetBool(p, "ok");
-        UINT64 tran_id = PackGetInt64(p, "tran_id");
+	if (p != NULL)
+	{
+		bool is_ok = PackGetBool(p, "ok");
+		UINT64 tran_id = PackGetInt64(p, "tran_id");
 
-        // This ExtractAndApplyDynList() calling was removed because it is not actually used and could be abused by
-        // illegal UDP packets that spoof the source IP address. 2023-6-14 Daiyuu Nobori
-        // ExtractAndApplyDynList(p);
+		// This ExtractAndApplyDynList() calling was removed because it is not actually used and could be abused by
+		// illegal UDP packets that spoof the source IP address. 2023-6-14 Daiyuu Nobori
+		// ExtractAndApplyDynList(p);
 
-        if (r->ServerMode)
-        {
-            if (PackCmpStr(p, "opcode", "get_token"))
-            {
-                // Get the Token
-                if (is_ok && (tran_id == r->NatT_TranId))
-                {
-                    char tmp[MAX_SIZE];
+		if (r->ServerMode)
+		{
+			if (PackCmpStr(p, "opcode", "get_token"))
+			{
+				// Get the Token
+				if (is_ok && (tran_id == r->NatT_TranId))
+				{
+					char tmp[MAX_SIZE];
 
-                    if (PackGetStr(p, "token", tmp, sizeof(tmp)) && IsEmptyStr(tmp) == false)
-                    {
-                        char myip[MAX_SIZE];
-                        // Acquisition success
-                        StrCpy(r->NatT_Token, sizeof(r->NatT_Token), tmp);
-                        r->NatT_Token_Ok = true;
-                        r->NatT_GetTokenNextTick = r->Now + (UINT64)GenRandInterval(UDP_NAT_T_GET_TOKEN_INTERVAL_2_MIN, UDP_NAT_T_GET_TOKEN_INTERVAL_2_MAX);
-                        r->NatT_GetTokenFailNum = 0;
+					if (PackGetStr(p, "token", tmp, sizeof(tmp)) && IsEmptyStr(tmp) == false)
+					{
+						char myip[MAX_SIZE];
+						// Acquisition success
+						StrCpy(r->NatT_Token, sizeof(r->NatT_Token), tmp);
+						r->NatT_Token_Ok = true;
+						r->NatT_GetTokenNextTick = r->Now + (UINT64)GenRandInterval(UDP_NAT_T_GET_TOKEN_INTERVAL_2_MIN, UDP_NAT_T_GET_TOKEN_INTERVAL_2_MAX);
+						r->NatT_GetTokenFailNum = 0;
 
-                        // Since success to obtain the self global IPv4 address,
-                        // re-obtain the destination NAT-T host from this IPv4 address
-                        if (PackGetStr(p, "your_ip", myip, sizeof(myip)))
-                        {
-                            IP ip;
-                            char new_hostname[MAX_SIZE];
+						// Since success to obtain the self global IPv4 address,
+						// re-obtain the destination NAT-T host from this IPv4 address
+						if (PackGetStr(p, "your_ip", myip, sizeof(myip)))
+						{
+							IP ip;
+							char new_hostname[MAX_SIZE];
 
-                            StrToIP(&ip, myip);
+							StrToIP(&ip, myip);
 
-                            SetCurrentGlobalIP(&ip, false);
+							SetCurrentGlobalIP(&ip, false);
 
-                            RUDPGetRegisterHostNameByIP(new_hostname,
-                                                        sizeof(new_hostname), &ip);
+							RUDPGetRegisterHostNameByIP(new_hostname,
+							                            sizeof(new_hostname), &ip);
 
-                            Lock(r->Lock);
-                            {
-                                if (StrCmpi(r->CurrentRegisterHostname, new_hostname) != 0)
-                                {
-                                    r->NumChangedHostname++;
+							Lock(r->Lock);
+							{
+								if (StrCmpi(r->CurrentRegisterHostname, new_hostname) != 0)
+								{
+									r->NumChangedHostname++;
 
-                                    if (r->NumChangedHostname <= RUDP_NATT_MAX_CONT_CHANGE_HOSTNAME)
-                                    {
-                                        if (r->NumChangedHostnameValueResetTick == 0)
-                                        {
-                                            r->NumChangedHostnameValueResetTick = r->Now + (UINT64)RUDP_NATT_CONT_CHANGE_HOSTNAME_RESET_INTERVAL;
-                                        }
+									if (r->NumChangedHostname <= RUDP_NATT_MAX_CONT_CHANGE_HOSTNAME)
+									{
+										if (r->NumChangedHostnameValueResetTick == 0)
+										{
+											r->NumChangedHostnameValueResetTick = r->Now + (UINT64)RUDP_NATT_CONT_CHANGE_HOSTNAME_RESET_INTERVAL;
+										}
 
-                                        // Change the host name
-                                        Debug("CurrentRegisterHostname Changed: New=%s\n", new_hostname);
-                                        StrCpy(r->CurrentRegisterHostname, sizeof(r->CurrentRegisterHostname), new_hostname);
+										// Change the host name
+										Debug("CurrentRegisterHostname Changed: New=%s\n", new_hostname);
+										StrCpy(r->CurrentRegisterHostname, sizeof(r->CurrentRegisterHostname), new_hostname);
 
-                                        Zero(&r->NatT_IP, sizeof(r->NatT_IP));
-                                        //Zero(&r->NatT_IP_Safe, sizeof(r->NatT_IP_Safe));
+										Zero(&r->NatT_IP, sizeof(r->NatT_IP));
+										//Zero(&r->NatT_IP_Safe, sizeof(r->NatT_IP_Safe));
 
-                                        Set(r->HaltEvent);
-                                    }
-                                    else
-                                    {
-                                        if (r->NumChangedHostnameValueResetTick == 0)
-                                        {
-                                            r->NumChangedHostnameValueResetTick = r->Now + (UINT64)RUDP_NATT_CONT_CHANGE_HOSTNAME_RESET_INTERVAL;
-                                        }
+										Set(r->HaltEvent);
+									}
+									else
+									{
+										if (r->NumChangedHostnameValueResetTick == 0)
+										{
+											r->NumChangedHostnameValueResetTick = r->Now + (UINT64)RUDP_NATT_CONT_CHANGE_HOSTNAME_RESET_INTERVAL;
+										}
 
-                                        if (r->Now >= r->NumChangedHostnameValueResetTick)
-                                        {
-                                            r->NumChangedHostname = 0;
-                                            r->NumChangedHostnameValueResetTick = 0;
-                                        }
-                                    }
-                                }
-                                else
-                                {
-                                    r->NumChangedHostname = 0;
-                                    r->NumChangedHostnameValueResetTick = 0;
-                                }
-                            }
-                            Unlock(r->Lock);
-                        }
+										if (r->Now >= r->NumChangedHostnameValueResetTick)
+										{
+											r->NumChangedHostname = 0;
+											r->NumChangedHostnameValueResetTick = 0;
+										}
+									}
+								}
+								else
+								{
+									r->NumChangedHostname = 0;
+									r->NumChangedHostnameValueResetTick = 0;
+								}
+							}
+							Unlock(r->Lock);
+						}
 
-                        AddInterrupt(r->Interrupt, r->NatT_GetTokenNextTick);
-                    }
-                }
-            }
-            else if (PackCmpStr(p, "opcode", "nat_t_register"))
-            {
-                // NAT-T server registration result
-                if (is_ok && (tran_id == r->NatT_TranId))
-                {
-                    UINT my_global_port;
-                    // Successful registration
-                    r->NatT_Register_Ok = true;
-                    r->NatT_RegisterNextTick = r->Now + (UINT64)GenRandInterval(UDP_NAT_T_REGISTER_INTERVAL_MIN, UDP_NAT_T_REGISTER_INTERVAL_MAX);
-                    r->NatT_RegisterFailNum = 0;
+						AddInterrupt(r->Interrupt, r->NatT_GetTokenNextTick);
+					}
+				}
+			}
+			else if (PackCmpStr(p, "opcode", "nat_t_register"))
+			{
+				// NAT-T server registration result
+				if (is_ok && (tran_id == r->NatT_TranId))
+				{
+					UINT my_global_port;
+					// Successful registration
+					r->NatT_Register_Ok = true;
+					r->NatT_RegisterNextTick = r->Now + (UINT64)GenRandInterval(UDP_NAT_T_REGISTER_INTERVAL_MIN, UDP_NAT_T_REGISTER_INTERVAL_MAX);
+					r->NatT_RegisterFailNum = 0;
 
-                    Debug("NAT-T Registered.\n");
+					Debug("NAT-T Registered.\n");
 
-                    // Save the IP address and port number at the time of registration
-                    PackGetStr(p, "your_ip_and_port", r->NatT_Registered_IPAndPort, sizeof(r->NatT_Registered_IPAndPort));
+					// Save the IP address and port number at the time of registration
+					PackGetStr(p, "your_ip_and_port", r->NatT_Registered_IPAndPort, sizeof(r->NatT_Registered_IPAndPort));
 
-                    if (g_source_ip_validation_force_disable == false)
-                    {
-                        // Enable the source IP address validation mechanism
-                        r->NatT_EnableSourceIpValidation = PackGetBool(p, "enable_source_ip_validation");
+					if (g_source_ip_validation_force_disable == false)
+					{
+						// Enable the source IP address validation mechanism
+						r->NatT_EnableSourceIpValidation = PackGetBool(p, "enable_source_ip_validation");
 
-                    }
-                    else
-                    {
-                        // Force disable the source IP address validation mechanism
-                        r->NatT_EnableSourceIpValidation = false;
-                    }
+					}
+					else
+					{
+						// Force disable the source IP address validation mechanism
+						r->NatT_EnableSourceIpValidation = false;
+					}
 
-                    // Global port of itself
-                    my_global_port = PackGetInt(p, "your_port");
+					// Global port of itself
+					my_global_port = PackGetInt(p, "your_port");
 
-                    if (my_global_port != 0)
-                    {
-                        if (r->NatTGlobalUdpPort != NULL)
-                        {
-                            *r->NatTGlobalUdpPort = my_global_port;
-                        }
-                    }
+					if (my_global_port != 0)
+					{
+						if (r->NatTGlobalUdpPort != NULL)
+						{
+							*r->NatTGlobalUdpPort = my_global_port;
+						}
+					}
 
-                    AddInterrupt(r->Interrupt, r->NatT_RegisterNextTick);
-                }
-            }
-            else if (PackCmpStr(p, "opcode", "nat_t_connect_relay"))
-            {
-                // Connection request from the client via the NAT-T server
-                if (is_ok && (PackGetInt64(p, "session_key") == r->NatT_SessionKey))
-                {
-                    char client_ip_str[MAX_SIZE];
-                    UINT client_port;
-                    IP client_ip;
+					AddInterrupt(r->Interrupt, r->NatT_RegisterNextTick);
+				}
+			}
+			else if (PackCmpStr(p, "opcode", "nat_t_connect_relay"))
+			{
+				// Connection request from the client via the NAT-T server
+				if (is_ok && (PackGetInt64(p, "session_key") == r->NatT_SessionKey))
+				{
+					char client_ip_str[MAX_SIZE];
+					UINT client_port;
+					IP client_ip;
 
-                    PackGetStr(p, "client_ip", client_ip_str, sizeof(client_ip_str));
-                    client_port = PackGetInt(p, "client_port");
-                    StrToIP(&client_ip, client_ip_str);
+					PackGetStr(p, "client_ip", client_ip_str, sizeof(client_ip_str));
+					client_port = PackGetInt(p, "client_port");
+					StrToIP(&client_ip, client_ip_str);
 
-                    if (IsZeroIp(&client_ip) == false && client_port != 0)
-                    {
-                        UCHAR *rand_data;
-                        UINT rand_size;
+					if (IsZeroIp(&client_ip) == false && client_port != 0)
+					{
+						UCHAR *rand_data;
+						UINT rand_size;
 
-                        if (r->NatT_EnableSourceIpValidation)
-                        {
-                            RUDPAddIpToValidateList(r, &client_ip);
-                        }
+						if (r->NatT_EnableSourceIpValidation)
+						{
+							RUDPAddIpToValidateList(r, &client_ip);
+						}
 
-                        rand_size = Rand32() % 19;
-                        rand_data = Malloc(rand_size);
+						rand_size = Rand32() % 19;
+						rand_data = Malloc(rand_size);
 
-                        Rand(rand_data, rand_size);
+						Rand(rand_data, rand_size);
 
-                        RUDPSendPacket(r, &client_ip, client_port, rand_data, rand_size, 0);
+						RUDPSendPacket(r, &client_ip, client_port, rand_data, rand_size, 0);
 
-                        Free(rand_data);
-                    }
-                }
-            }
-        }
+						Free(rand_data);
+					}
+				}
+			}
+		}
 
-        FreePack(p);
-    }
+		FreePack(p);
+	}
 
-    FreeBuf(b);
+	FreeBuf(b);
 }
 
 // Process such as packet transmission for NAT-T server
 void RUDPDo_NatT_Interrupt(RUDP_STACK *r)
 {
-    // Validate arguments
-    if (r == NULL)
-    {
-        return;
-    }
+	// Validate arguments
+	if (r == NULL)
+	{
+		return;
+	}
 
-    if (r->ServerMode)
-    {
+	if (r->ServerMode)
+	{
 
-        if (g_no_rudp_register == false && IsZeroIp(&r->NatT_IP_Safe) == false)
-        {
-            if (r->NatT_GetTokenNextTick == 0 || r->Now >= r->NatT_GetTokenNextTick)
-            {
-                // Try to get a token from the NAT-T server periodically
-                PACK *p = NewPack();
-                BUF *b;
+		if (g_no_rudp_register == false && IsZeroIp(&r->NatT_IP_Safe) == false)
+		{
+			if (r->NatT_GetTokenNextTick == 0 || r->Now >= r->NatT_GetTokenNextTick)
+			{
+				// Try to get a token from the NAT-T server periodically
+				PACK *p = NewPack();
+				BUF *b;
 
-                PackAddStr(p, "opcode", "get_token");
-                PackAddInt64(p, "tran_id", r->NatT_TranId);
-                PackAddInt(p, "nat_traversal_version", UDP_NAT_TRAVERSAL_VERSION);
+				PackAddStr(p, "opcode", "get_token");
+				PackAddInt64(p, "tran_id", r->NatT_TranId);
+				PackAddInt(p, "nat_traversal_version", UDP_NAT_TRAVERSAL_VERSION);
 
-                b = PackToBuf(p);
-                FreePack(p);
+				b = PackToBuf(p);
+				FreePack(p);
 
-                RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, b->Buf, b->Size, 0);
+				RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, b->Buf, b->Size, 0);
 
-                FreeBuf(b);
+				FreeBuf(b);
 
-                // Determine the next acquisition time
-                r->NatT_GetTokenFailNum++;
-                r->NatT_GetTokenNextTick = r->Now + (UINT64)(UDP_NAT_T_GET_TOKEN_INTERVAL_1 * (UINT64)MIN(r->NatT_GetTokenFailNum, UDP_NAT_T_GET_TOKEN_INTERVAL_FAIL_MAX));
-                AddInterrupt(r->Interrupt, r->NatT_GetTokenNextTick);
-                r->NatT_Token_Ok = false;
-            }
-        }
+				// Determine the next acquisition time
+				r->NatT_GetTokenFailNum++;
+				r->NatT_GetTokenNextTick = r->Now + (UINT64)(UDP_NAT_T_GET_TOKEN_INTERVAL_1 * (UINT64)MIN(r->NatT_GetTokenFailNum, UDP_NAT_T_GET_TOKEN_INTERVAL_FAIL_MAX));
+				AddInterrupt(r->Interrupt, r->NatT_GetTokenNextTick);
+				r->NatT_Token_Ok = false;
+			}
+		}
 
-        {
-            if (IsZeroIp(&r->NatT_IP_Safe) == false)
-            {
-                // Normal servers: Send request packets to the NAT-T server
-                if (r->NatT_NextNatStatusCheckTick == 0 || r->Now >= r->NatT_NextNatStatusCheckTick)
-                {
-                    UCHAR a = 'A';
-                    UINT ddns_hash;
-                    // Check of the NAT state
-                    RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, &a, 1, 0);
+		{
+			if (IsZeroIp(&r->NatT_IP_Safe) == false)
+			{
+				// Normal servers: Send request packets to the NAT-T server
+				if (r->NatT_NextNatStatusCheckTick == 0 || r->Now >= r->NatT_NextNatStatusCheckTick)
+				{
+					UCHAR a = 'A';
+					UINT ddns_hash;
+					// Check of the NAT state
+					RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, &a, 1, 0);
 
-                    // Execution time of the next
-                    r->NatT_NextNatStatusCheckTick = r->Now + (UINT64)GenRandInterval(UDP_NAT_T_NAT_STATUS_CHECK_INTERVAL_MIN, UDP_NAT_T_NAT_STATUS_CHECK_INTERVAL_MAX);
-                    AddInterrupt(r->Interrupt, r->NatT_NextNatStatusCheckTick);
+					// Execution time of the next
+					r->NatT_NextNatStatusCheckTick = r->Now + (UINT64)GenRandInterval(UDP_NAT_T_NAT_STATUS_CHECK_INTERVAL_MIN, UDP_NAT_T_NAT_STATUS_CHECK_INTERVAL_MAX);
+					AddInterrupt(r->Interrupt, r->NatT_NextNatStatusCheckTick);
 
-                    // Check whether the DDNS host name changing have not occurred
-                    ddns_hash = GetCurrentDDnsFqdnHash();
+					// Check whether the DDNS host name changing have not occurred
+					ddns_hash = GetCurrentDDnsFqdnHash();
 
-                    if (r->LastDDnsFqdnHash != ddns_hash)
-                    {
-                        r->LastDDnsFqdnHash = ddns_hash;
-                        // Do the Register immediately if there is a change in the DDNS host name
-                        r->NatT_RegisterNextTick = 0;
-                    }
-                }
-            }
-        }
+					if (r->LastDDnsFqdnHash != ddns_hash)
+					{
+						r->LastDDnsFqdnHash = ddns_hash;
+						// Do the Register immediately if there is a change in the DDNS host name
+						r->NatT_RegisterNextTick = 0;
+					}
+				}
+			}
+		}
 
-        if (r->NatT_Token_Ok && g_no_rudp_register == false && IsZeroIp(&r->NatT_IP_Safe) == false)
-        {
-            if (r->NatT_RegisterNextTick == 0 || r->Now >= r->NatT_RegisterNextTick)
-            {
-                // Try to register itself periodically for NAT-T server
-                PACK *p = NewPack();
-                BUF *b;
-                char private_ip_str[MAX_SIZE];
-                char machine_key[MAX_SIZE];
-                char machine_name[MAX_SIZE];
-                UCHAR hash[SHA1_SIZE];
-                char ddns_fqdn[MAX_SIZE];
+		if (r->NatT_Token_Ok && g_no_rudp_register == false && IsZeroIp(&r->NatT_IP_Safe) == false)
+		{
+			if (r->NatT_RegisterNextTick == 0 || r->Now >= r->NatT_RegisterNextTick)
+			{
+				// Try to register itself periodically for NAT-T server
+				PACK *p = NewPack();
+				BUF *b;
+				char private_ip_str[MAX_SIZE];
+				char machine_key[MAX_SIZE];
+				char machine_name[MAX_SIZE];
+				UCHAR hash[SHA1_SIZE];
+				char ddns_fqdn[MAX_SIZE];
 
-                Debug("NAT-T Registering...\n");
+				Debug("NAT-T Registering...\n");
 
-                GetCurrentDDnsFqdn(ddns_fqdn, sizeof(ddns_fqdn));
+				GetCurrentDDnsFqdn(ddns_fqdn, sizeof(ddns_fqdn));
 
-                PackAddStr(p, "opcode", "nat_t_register");
-                PackAddInt64(p, "tran_id", r->NatT_TranId);
-                PackAddStr(p, "token", r->NatT_Token);
-                PackAddStr(p, "svc_name", r->SvcName);
-                PackAddStr(p, "product_str", "SoftEther OSS");
-                PackAddInt64(p, "session_key", r->NatT_SessionKey);
-                PackAddInt(p, "nat_traversal_version", UDP_NAT_TRAVERSAL_VERSION);
+				PackAddStr(p, "opcode", "nat_t_register");
+				PackAddInt64(p, "tran_id", r->NatT_TranId);
+				PackAddStr(p, "token", r->NatT_Token);
+				PackAddStr(p, "svc_name", r->SvcName);
+				PackAddStr(p, "product_str", "SoftEther OSS");
+				PackAddInt64(p, "session_key", r->NatT_SessionKey);
+				PackAddInt(p, "nat_traversal_version", UDP_NAT_TRAVERSAL_VERSION);
 
 
-                if (g_natt_low_priority)
-                {
-                    PackAddBool(p, "low_priority", g_natt_low_priority);
-                }
+				if (g_natt_low_priority)
+				{
+					PackAddBool(p, "low_priority", g_natt_low_priority);
+				}
 
-                Zero(private_ip_str, sizeof(private_ip_str));
-                if (IsZeroIp(&r->My_Private_IP_Safe) == false)
-                {
-                    IPToStr(private_ip_str, sizeof(private_ip_str), &r->My_Private_IP_Safe);
-                    PackAddStr(p, "private_ip", private_ip_str);
-                }
+				Zero(private_ip_str, sizeof(private_ip_str));
+				if (IsZeroIp(&r->My_Private_IP_Safe) == false)
+				{
+					IPToStr(private_ip_str, sizeof(private_ip_str), &r->My_Private_IP_Safe);
+					PackAddStr(p, "private_ip", private_ip_str);
+				}
 
-                PackAddInt(p, "private_port", r->UdpSock->LocalPort);
+				PackAddInt(p, "private_port", r->UdpSock->LocalPort);
 
-                Zero(hash, sizeof(hash));
-                GetCurrentMachineIpProcessHash(hash);
-                BinToStr(machine_key, sizeof(machine_key), hash, sizeof(hash));
-                PackAddStr(p, "machine_key", machine_key);
+				Zero(hash, sizeof(hash));
+				GetCurrentMachineIpProcessHash(hash);
+				BinToStr(machine_key, sizeof(machine_key), hash, sizeof(hash));
+				PackAddStr(p, "machine_key", machine_key);
 
-                Zero(machine_name, sizeof(machine_name));
-                GetMachineName(machine_name, sizeof(machine_name));
-                PackAddStr(p, "host_name", machine_name);
-                PackAddStr(p, "ddns_fqdn", ddns_fqdn);
+				Zero(machine_name, sizeof(machine_name));
+				GetMachineName(machine_name, sizeof(machine_name));
+				PackAddStr(p, "host_name", machine_name);
+				PackAddStr(p, "ddns_fqdn", ddns_fqdn);
 
-                b = PackToBuf(p);
-                FreePack(p);
+				b = PackToBuf(p);
+				FreePack(p);
 
-                RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, b->Buf, b->Size, 0);
-                //RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, "a", 1);
+				RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, b->Buf, b->Size, 0);
+				//RUDPSendPacket(r, &r->NatT_IP_Safe, UDP_NAT_T_PORT, "a", 1);
 
-                FreeBuf(b);
+				FreeBuf(b);
 
-                // Determine the next acquisition time
-                r->NatT_RegisterFailNum++;
-                r->NatT_RegisterNextTick = r->Now + (UINT64)UDP_NAT_T_REGISTER_INTERVAL_INITIAL * (UINT64)MIN(r->NatT_RegisterFailNum, UDP_NAT_T_REGISTER_INTERVAL_FAIL_MAX);
-                AddInterrupt(r->Interrupt, r->NatT_RegisterNextTick);
-                r->NatT_Register_Ok = false;
-            }
-        }
-    }
+				// Determine the next acquisition time
+				r->NatT_RegisterFailNum++;
+				r->NatT_RegisterNextTick = r->Now + (UINT64)UDP_NAT_T_REGISTER_INTERVAL_INITIAL * (UINT64)MIN(r->NatT_RegisterFailNum, UDP_NAT_T_REGISTER_INTERVAL_FAIL_MAX);
+				AddInterrupt(r->Interrupt, r->NatT_RegisterNextTick);
+				r->NatT_Register_Ok = false;
+			}
+		}
+	}
 }
 
 // R-UDP packet reception procedure

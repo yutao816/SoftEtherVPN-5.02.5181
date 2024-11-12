@@ -26,6 +26,8 @@
 #include "NullLan.h"
 #endif
 
+#include "../mqtt_vpn/mqtt_vpn.h"
+
 #include "Mayaqua/Cfg.h"
 #include "Mayaqua/Encrypt.h"
 #include "Mayaqua/FileIO.h"
@@ -3445,32 +3447,78 @@ void CcSetServiceToForegroundProcess(REMOTE_CLIENT *r)
 	}*/
 }
 
+// 设置MQTT配置
+void CiSetMqttConfig(CLIENT *c, char *broker, int qos)
+{
+    // 验证参数
+    if (c == NULL || broker == NULL)
+    {
+        return;
+    }
+
+    Lock(c->lock);
+    {
+        StrCpy(c->MqttConfig->broker, sizeof(c->MqttConfig->broker), broker);
+        c->MqttConfig->qos = qos;
+    }
+    Unlock(c->lock);
+}
+
+// 获取MQTT配置
+MQTT_CONFIG* CiGetMqttConfig(CLIENT *c)
+{
+    MQTT_CONFIG *ret = NULL;
+    // 验证参数
+    if (c == NULL)
+    {
+        return NULL;
+    }
+
+    Lock(c->lock);
+    {
+        if (c->MqttConfig != NULL)
+        {
+            ret = c->MqttConfig;
+        }
+    }
+    Unlock(c->lock);
+
+    return ret;
+}
 // Connect
 UINT CcConnect(REMOTE_CLIENT *r, RPC_CLIENT_CONNECT *connect)
 {
-	PACK *ret, *p;
-	UINT err = 0;
-	// Validate arguments
-	if (r == NULL || connect == NULL)
-	{
-		return ERR_INTERNAL_ERROR;
-	}
+    PACK *ret, *p;
+    UINT err = 0;
+    // 验证参数
+    if (r == NULL || connect == NULL)
+    {
+        return ERR_INTERNAL_ERROR;
+    }
 
-	CcSetServiceToForegroundProcess(r);
+    CcSetServiceToForegroundProcess(r);
 
-	p = NewPack();
-	OutRpcClientConnect(p, connect);
+    p = NewPack();
+    OutRpcClientConnect(p, connect);
 
-	ret = RpcCall(r->Rpc, "Connect", p);
+    // 如果启用了MQTT，设置相关标志
+    if (GetCurrentMqttConfig() != NULL)
+    {
+        PackAddBool(p, "use_mqtt", true);
+        PackAddStr(p, "mqtt_broker", GetCurrentMqttConfig()->broker);
+        PackAddInt(p, "mqtt_qos", GetCurrentMqttConfig()->qos);
+    }
 
-	if (RpcIsOk(ret) == false)
-	{
-		err = RpcGetError(ret);
-	}
+    ret = RpcCall(r->Rpc, "Connect", p);
 
-	FreePack(ret);
+    if (RpcIsOk(ret) == false)
+    {
+        err = RpcGetError(ret);
+    }
 
-	return err;
+    FreePack(ret);
+
+    return err;
 }
 
 // Disconnect
@@ -10381,6 +10429,9 @@ CLIENT *CiNewClient()
 	}
 #endif	// OS_WIN32
 
+ // 初始化MQTT配置
+    c->MqttConfig = ZeroMalloc(sizeof(MQTT_CONFIG));
+    c->MqttConfig->qos = MQTT_QOS;
 
 	c->CmSetting = ZeroMalloc(sizeof(CM_SETTING));
 
@@ -10499,6 +10550,13 @@ void CiCleanupClient(CLIENT *c)
 	{
 		return;
 	}
+	// 清理MQTT配置
+    if (c->MqttConfig != NULL)
+    {
+        Free(c->MqttConfig);
+        c->MqttConfig = NULL;
+    }
+
 
 
 	// Release the settings

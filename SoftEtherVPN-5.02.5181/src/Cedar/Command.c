@@ -21,6 +21,7 @@
 #include "Server.h"
 #include "Virtual.h"
 #include "WinUi.h"
+#include "../mqtt_vpn/mqtt_vpn.h"
 
 #include "Mayaqua/Cfg.h"
 #include "Mayaqua/FileIO.h"
@@ -3116,6 +3117,7 @@ void PcMain(PC *pc)
 			{"AccountServerCertGet", PcAccountServerCertGet},
 			{"AccountDetailSet", PcAccountDetailSet},
 			{"AccountRename", PcAccountRename},
+			{"MqttConnect", PcMqttConnect},
 			{"AccountConnect", PcAccountConnect},
 			{"AccountDisconnect", PcAccountDisconnect},
 			{"AccountStatusGet", PcAccountStatusGet},
@@ -6213,7 +6215,259 @@ UINT PcAccountRename(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
 
 	return ret;
 }
+//mqtt连接
+UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
+{
+    LIST *o;
+    PC *pc = (PC *)param;
+    UINT ret = ERR_NO_ERROR;
+    CEDAR *cedar;
+    CLIENT_OPTION *option;
+    CLIENT_AUTH *auth;
+    PACKET_ADAPTER *pa;
+    VH_OPTION *vh_option;
+    
+    // 参数检查
+    if (c == NULL || pc == NULL)
+    {
+        return ERR_INVALID_PARAMETER;
+    }
+    
+    // 初始化MQTT
+    if (!InitMqttVpn())
+    {
+        c->Write(c, _UU("CMD_MqttConnect_Init_Failed"));
+        return ERR_INTERNAL_ERROR;
+    }
+    
+    // MQTT连接参数
+    PARAM args[] =
+    {
+        {"[name]", CmdPrompt, _UU("CMD_AccountCreate_Prompt_Name"), CmdEvalNotEmpty, NULL},
+        {"[broker]", CmdPrompt, _UU("CMD_MqttConnect_Prompt_Broker"), CmdEvalNotEmpty, NULL},
+    };
 
+    // 获取参数列表
+    o = ParseCommandList(c, cmd_name, str, args, sizeof(args) / sizeof(args[0]));
+    if (o == NULL)
+    {
+        FreeMqttVpn();
+        return ERR_INVALID_PARAMETER;
+    }
+
+    // 设置MQTT配置
+    char *broker = GetParamStr(o, "[broker]");
+    if (!SetMqttConfig(broker))
+    {
+        c->Write(c, _UU("CMD_MqttConnect_Config_Failed"));
+        FreeMqttVpn();
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 创建新的Cedar实例
+    cedar = NewCedar(NULL, NULL);
+    if (cedar == NULL)
+    {
+        FreeMqttVpn();
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 创建客户端选项
+    option = ZeroMalloc(sizeof(CLIENT_OPTION));
+    
+    // 设置MQTT相关选项
+    option->UseMqtt = true;
+    option->RequireMqtt = true;
+    
+    // 设置基本连接选项
+    option->RequireBridgeRoutingMode = true;
+    option->NoUdpAcceleration = true;
+    option->MaxConnection = 1;
+    option->UseEncrypt = true;
+    option->UseCompress = true;
+    option->NumRetry = INFINITE;
+    option->RetryInterval = 15;
+    
+    // 设置账户名
+    UniStrCpy(option->AccountName, sizeof(option->AccountName), GetParamUniStr(o, "[name]"));
+
+    // 创建认证信息
+    auth = ZeroMalloc(sizeof(CLIENT_AUTH));
+    auth->AuthType = CLIENT_AUTHTYPE_ANONYMOUS;
+
+    // 创建虚拟主机选项
+    vh_option = ZeroMalloc(sizeof(VH_OPTION));
+    vh_option->UseNat = true;
+    vh_option->UseDhcp = true;
+
+    // 创建虚拟网卡适配器
+    VH *v = NewVirtualHost(cedar, option, auth, vh_option);
+    if (v == NULL)
+    {
+        FreeMqttVpn();
+        Free(vh_option);
+        Free(auth);
+        Free(option);
+        ReleaseCedar(cedar);
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 获取虚拟网卡适配器
+    pa = VirtualGetPacketAdapter();
+    if (pa == NULL)
+    {
+        FreeMqttVpn();
+        CleanupVirtual(v);
+        Free(vh_option);
+        Free(auth);
+        Free(option);
+        ReleaseCedar(cedar);
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 设置PacketAdapter的参数
+    pa->Param = v;
+
+    // 创建Session，传入所有必要参数
+    SESSION *s = NewClientSession(cedar, option, auth, pa);
+    if (s == NULL)
+    {
+        FreeMqttVpn();
+        CleanupVirtual(v);
+        Free(vh_option);
+        Free(auth);
+        Free(option);
+        ReleaseCedar(cedar);
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 设置Session的VirtualHost标志
+    s->VirtualHost = true;
+
+    // 创建Connection
+    CONNECTION *conn = NewClientConnection(s);
+    if (conn == NULL)
+    {
+        ReleaseSession(s);
+        FreeMqttVpn();
+        CleanupVirtual(v);
+        Free(vh_option);
+        Free(auth);
+        Free(option);
+        ReleaseCedar(cedar);
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 设置为MQTT协议
+    conn->Protocol = CONNECTION_MQTT;
+
+    // 生成随机主题
+    char random_suffix[33];
+    GenerateRandomString(random_suffix, sizeof(random_suffix));
+    Format(conn->MqttTopic, sizeof(conn->MqttTopic), "%s/%s", TOPIC_PRE, random_suffix);
+
+    // 订阅主题
+    if (!SubscribeMqttTopic(conn, conn->MqttTopic))
+    {
+        c->Write(c, _UU("CMD_MqttConnect_Subscribe_Failed"));
+        CleanupMqttConnection(conn);
+        ReleaseConnection(conn);
+        ReleaseSession(s);
+        FreeMqttVpn();
+        CleanupVirtual(v);
+        Free(vh_option);
+        Free(auth);
+        Free(option);
+        ReleaseCedar(cedar);
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // // 连接MQTT
+    // if (!ConnectMqttClient(conn))
+    // {
+    //     c->Write(c, _UU("CMD_MqttConnect_Failed"));
+    //     ReleaseConnection(conn);
+    //     ReleaseSession(s);
+    //     FreeMqttVpn();
+    //     CleanupVirtual(v);
+    //     Free(vh_option);
+    //     Free(auth);
+    //     Free(option);
+    //     ReleaseCedar(cedar);
+    //     FreeParamValueList(o);
+    //     return ERR_INTERNAL_ERROR;
+    // }
+
+    // // 生成并设置MQTT主题
+    // UINT ip_hash = GetHostIPAddressHash32();
+    // if (ip_hash != 0)
+    // {
+    //     GenerateMqttTopic(conn->MqttTopic, sizeof(conn->MqttTopic), ip_hash);
+        
+    //     // 订阅主题
+    //     if (!SubscribeMqttTopic(conn, conn->MqttTopic))
+    //     {
+    //         c->Write(c, _UU("CMD_MqttConnect_Subscribe_Failed"));
+    //         CleanupMqttConnection(conn);
+    //         ReleaseConnection(conn);
+    //         ReleaseSession(s);
+    //         FreeMqttVpn();
+    //         CleanupVirtual(v);
+    //         Free(vh_option);
+    //         Free(auth);
+    //         Free(option);
+    //         ReleaseCedar(cedar);
+    //         FreeParamValueList(o);
+    //         return ERR_INTERNAL_ERROR;
+    //     }
+    // }
+    // else
+    // {
+    //     c->Write(c, _UU("CMD_MqttConnect_IP_Failed"));
+    //     CleanupMqttConnection(conn);
+    //     ReleaseConnection(conn);
+    //     ReleaseSession(s);
+    //     FreeMqttVpn();
+    //     CleanupVirtual(v);
+    //     Free(vh_option);
+    //     Free(auth);
+    //     Free(option);
+    //     ReleaseCedar(cedar);
+    //     FreeParamValueList(o);
+    //     return ERR_INTERNAL_ERROR;
+    // }
+
+    // 连接成功
+    c->Write(c, _UU("CMD_MqttConnect_Success"));
+    
+    // 显示连接信息
+    const MQTT_CONFIG* mqtt_config = GetCurrentMqttConfig();
+    if (mqtt_config != NULL)
+    {
+        wchar_t tmp[MAX_SIZE];
+        UniFormat(tmp, sizeof(tmp), _UU("CMD_MqttConnect_Info"), 
+            mqtt_config->broker, conn->MqttTopic);
+        c->Write(c, tmp);
+    }
+
+    // 保存连接到PC
+    pc->RemoteClient = conn;
+
+    // 清理资源
+    Free(vh_option);
+    Free(auth);
+    Free(option);
+    ReleaseCedar(cedar);
+    FreeParamValueList(o);
+    return ERR_NO_ERROR;
+}
 // Start to connect to the VPN Server using the connection settings
 UINT PcAccountConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
 {

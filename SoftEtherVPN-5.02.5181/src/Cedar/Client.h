@@ -11,6 +11,7 @@
 #include "Account.h"
 #include "Session.h"
 #include "Wpc.h"
+#include "../mqtt_vpn/mqtt_vpn.h"
 
 #define	CLIENT_CONFIG_PORT					GC_CLIENT_CONFIG_PORT		// Client port number
 #define	CLIENT_NOTIFY_PORT					GC_CLIENT_NOTIFY_PORT		// Client notification port number
@@ -403,6 +404,7 @@ struct CLIENT
 	bool NoSaveConfig;						// Do not save the settings
 	INTERNET_SETTING CommonProxySetting;	// Common proxy settings
 	void *MsSuspendHandler;					// MS suspend handler
+	MQTT_CONFIG *MqttConfig;  // MQTT配置
 
 };
 
@@ -443,8 +445,8 @@ struct CM_SETTING
 	UCHAR HashedPassword[SHA1_SIZE];		// Password
 };
 
-
-
+//MQTT连接函数定义
+UINT CcConnectViaMqtt(REMOTE_CLIENT *r, RPC_CLIENT_CONNECT *connect);
 
 // Function prototype
 REMOTE_CLIENT *CcConnectRpc(char *server_name, char *password, bool *bad_pass, bool *no_remote, UINT wait_retry);
@@ -749,7 +751,8 @@ void InRpcTrafficEx(TRAFFIC *t, PACK *p, UINT i);
 void OutRpcTrafficEx(TRAFFIC *t, PACK *p, UINT i, UINT num);
 void OutRpcCmSetting(PACK *p, CM_SETTING *c);
 void InRpcCmSetting(CM_SETTING *c, PACK *p);
-
+void CiSetMqttConfig(CLIENT *c, char *broker, int qos);
+MQTT_CONFIG* CiGetMqttConfig(CLIENT *c);
 #ifdef OS_WIN32
 typedef struct MS_DRIVER_VER MS_DRIVER_VER;
 void CiInitDriverVerStruct(MS_DRIVER_VER *ver);

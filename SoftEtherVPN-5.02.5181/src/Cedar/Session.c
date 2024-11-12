@@ -62,6 +62,24 @@ void SessionMain(SESSION *s)
 	bool lock_receive_blocks_queue = false;
 	UINT static_ip = 0;
 
+	// 添加MQTT数据处理
+     if (s->Connection->Protocol == CONNECTION_MQTT)
+    {
+        // 处理发送队列中的数据
+        ConnectionSend(s->Connection, Tick64());
+
+        // 处理接收到的数据
+        BLOCK *b;
+        while ((b = GetNext(s->Connection->ReceivedBlocks)) != NULL)
+        {
+            if (s->Virtual != NULL)
+            {
+                VirtualPutPacket(s->Virtual, b->Buf, b->Size);
+            }
+            FreeBlock(b);
+        }
+    }
+
 	// Validate arguments
 	if (s == NULL)
 	{
@@ -1371,6 +1389,12 @@ void ReleaseSession(SESSION *s)
 	{
 		CleanupSession(s);
 	}
+	if (s->Virtual != NULL)
+    {
+    ReleaseVirtual(s->Virtual);
+    s->Virtual = NULL;
+    }
+	
 }
 
 // Display the total data transfer size of the session

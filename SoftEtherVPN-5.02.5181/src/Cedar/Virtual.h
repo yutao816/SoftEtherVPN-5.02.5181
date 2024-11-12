@@ -38,7 +38,7 @@
 // (Access the www.yahoo.com. Access the www.baidu.com from China. I am sorry.)
 #define	NN_CHECK_HOSTNAME				(IsEmptyStr(secure_nat_target_hostname) ? (IsUseAlternativeHostname() ? "www.baidu.com" : "www.yahoo.com") : secure_nat_target_hostname)
 
-
+typedef struct VH VIRTUAL;
 // Native NAT entry
 struct NATIVE_NAT_ENTRY
 {
