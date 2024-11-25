@@ -1441,7 +1441,7 @@ SEND_START:
 		}
 	}
 	//用mqtt处理数据并发送
-	else if (c->UseMqtt)
+	else if (c->Protocol == CONNECTION_MQTT)
     {
         SendDataWithMQTT(c);
         return;
@@ -1602,6 +1602,7 @@ void ConnectionReceive(CONNECTION *c, CANCEL *c1, CANCEL *c2)
 	bool no_spinlock_for_delay = false;
 	UINT64 now = Tick64();
 	HUB *hub = NULL;
+
 	// Validate arguments
 	if (c == NULL)
 	{
@@ -1609,6 +1610,13 @@ void ConnectionReceive(CONNECTION *c, CANCEL *c1, CANCEL *c2)
 	}
 
 	PROBE_STR("ConnectionReceive");
+	
+
+    if (c->RecvBuf == NULL)
+    {
+        c->RecvBuf = Malloc(RECV_BUF_SIZE);
+    }
+    buf = c->RecvBuf;  // 使用接收缓冲区
 
 	s = c->Session;
 
@@ -2314,86 +2322,113 @@ DISCONNECT_THIS_TCP:
 		Free(tcpsocks);
 	}
 	else if (c->Protocol == CONNECTION_UDP)
-	{
-		// UDP
-		UDP *udp = c->Udp;
-		SOCK *sock = NULL;
+{
+    // UDP
+    UDP *udp = c->Udp;
+    SOCK *sock = NULL;
 
-		if (s->ServerMode == false)
-		{
-			Lock(c->lock);
-			{
-				if (c->Udp->s != NULL)
-				{
-					sock = c->Udp->s;
-					if (sock != NULL)
-					{
-						AddRef(sock->ref);
-					}
-				}
-			}
-			Unlock(c->lock);
-
-			InitSockSet(&set);
-
-			if (sock != NULL)
-			{
-				AddSockSet(&set, sock);
-			}
-
-			Select(&set, SELECT_TIME, c1, c2);
-
-			if (sock != NULL)
-			{
-				IP ip;
-				UINT port;
-				UCHAR *buf;
-				UINT size;
-
-				while (true)
-				{
-					buf = c->RecvBuf;
-					size = RecvFrom(sock, &ip, &port, buf, RECV_BUF_SIZE);
-					if (size == 0 && sock->IgnoreRecvErr == false)
-					{
-						Debug("UDP Socket Disconnected.\n");
-						Lock(c->lock);
-						{
-							ReleaseSock(udp->s);
-							udp->s = NULL;
-						}
-						Unlock(c->lock);
-						break;
-					}
-					else if (size == SOCK_LATER)
-					{
-						break;
-					}
-					else
-					{
-						if (size)
-						{
-							PutUDPPacketData(c, buf, size);
-						}
-					}
-				}
-			}
-
-			if (sock != NULL)
-			{
-				Release(sock->ref);
-			}
-		}
-		else
-		{
-			Select(NULL, SELECT_TIME, c1, c2);
-		}
-	}
-	else if (c->Protocol == CONNECTION_MQTT)
+    // 如果不是服务器模式
+    if (s->ServerMode == false)
     {
-        ProcessMqttMessages(c);
-        return;
+        // 锁定连接以安全访问共享资源
+        Lock(c->lock);
+        {
+            // 尝试获取与UDP连接关联的套接字
+            if (c->Udp->s != NULL)
+            {
+                sock = c->Udp->s;
+                if (sock != NULL)
+                {
+                    // 增加套接字的引用计数，防止在使用期间被释放
+                    AddRef(sock->ref);
+                }
+            }
+        }
+        Unlock(c->lock);
+
+        // 初始化用于select操作的套接字集
+        InitSockSet(&set);
+
+        // 如果获取到有效的套接字，将其添加到套接字集中
+        if (sock != NULL)
+        {
+            AddSockSet(&set, sock);
+        }
+
+        // 执行select操作，检查套接字的可读性、可写性或异常
+        Select(&set, SELECT_TIME, c1, c2);
+
+        // 如果获取到有效的套接字，开始接收数据
+        if (sock != NULL)
+        {
+            IP ip;
+            UINT port;
+            UCHAR *buf;
+            UINT size;
+
+            // 持续从套接字接收数据
+            while (true)
+            {
+                buf = c->RecvBuf;
+                size = RecvFrom(sock, &ip, &port, buf, RECV_BUF_SIZE);
+                if (size == 0 && sock->IgnoreRecvErr == false)
+                {
+                    // 如果接收失败且不应忽略错误，记录调试信息并重置连接
+                    Debug("UDP Socket Disconnected.\n");
+                    Lock(c->lock);
+                    {
+                        ReleaseSock(udp->s);
+                        udp->s = NULL;
+                    }
+                    Unlock(c->lock);
+                    break;
+                }
+                else if (size == SOCK_LATER)
+                {
+                    // 如果当前无法完成接收，退出循环
+                    break;
+                }
+                else
+                {
+                    // 如果成功接收到数据，处理UDP数据包
+                    if (size)
+                    {
+                        PutUDPPacketData(c, buf, size);
+                    }
+                }
+            }
+        }
+
+        // 释放套接字的引用
+        if (sock != NULL)
+        {
+            Release(sock->ref);
+        }
     }
+    else
+    {
+        // 如果是服务器模式，执行没有套接字的select操作
+        Select(NULL, SELECT_TIME, c1, c2);
+    }
+}
+	// else if (c->Protocol == CONNECTION_MQTT)
+    // {
+    //     // 从MQTT客户端接收消息
+    //         int rc = MQTTClient_receive((MQTTClient)c->MQTTClient, 
+    //                                   &topic, 
+    //                                   &topic_len, 
+    //                                   &message, 
+    //                                   TIMEOUT);
+            
+    //         if (rc == MQTTCLIENT_SUCCESS && message != NULL)
+    //         {
+    //             // 处理接收到的消息
+    //             ProcessMqttMessages(c, message->payload, message->payloadlen);
+                
+    //             // 释放消息资源
+    //             MQTTClient_freeMessage(&message);
+    //             MQTTClient_free(topic);
+    // }
 
 	else if (c->Protocol == CONNECTION_HUB_SECURE_NAT)
 	{

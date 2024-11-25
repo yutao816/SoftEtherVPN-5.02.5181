@@ -18,7 +18,9 @@
 #include "Protocol.h"
 #include "Remote.h"
 #include "Virtual.h"
+#include "VLan.h"
 #include "VLanUnix.h"
+#include "Bridge.h"
 #include "VLanWin32.h"
 #include "Win32Com.h"
 #include "WinUi.h"
@@ -56,7 +58,6 @@ static LOCK *ci_active_sessions_lock = NULL;
 static UINT ci_num_active_sessions = 0;
 
 
-// 在Windows中 8或稍后，更改不合理的WCM设置，以确保VPN正常运行
 void CiDisableWcmNetworkMinimize(CLIENT *c)
 {
 #ifdef	OS_WIN32
@@ -3446,79 +3447,126 @@ void CcSetServiceToForegroundProcess(REMOTE_CLIENT *r)
 		}
 	}*/
 }
-
-// 设置MQTT配置
-void CiSetMqttConfig(CLIENT *c, char *broker, int qos)
+// MQTT会话线程函数
+void MqttSessionThread(THREAD *thread, void *param)
 {
-    // 验证参数
-    if (c == NULL || broker == NULL)
+    SESSION *s = (SESSION *)param;
+    if (s == NULL)
     {
         return;
     }
-
-    Lock(c->lock);
+    
+    Debug("MqttSessionThread: Starting session");
+    
+    // 1. 初始化线程
+    NoticeThreadInit(thread);
+    
+    // 2. 设置会话状态
+    s->Halt = false;
+    s->LastCommTime = Tick64();
+    
+    // 3. 初始化数据包队列
+    if (s->Connection)
     {
-        StrCpy(c->MqttConfig->broker, sizeof(c->MqttConfig->broker), broker);
-        c->MqttConfig->qos = qos;
+        s->Connection->ReceivedBlocks = NewQueue();
+        s->Connection->SendBlocks = NewQueue();
     }
-    Unlock(c->lock);
-}
-
-// 获取MQTT配置
-MQTT_CONFIG* CiGetMqttConfig(CLIENT *c)
-{
-    MQTT_CONFIG *ret = NULL;
-    // 验证参数
-    if (c == NULL)
+    
+    // 4. 运行主会话循环
+    SessionMain(s);
+    
+    // 5. 清理资源
+    if (s->Connection)
     {
-        return NULL;
-    }
-
-    Lock(c->lock);
-    {
-        if (c->MqttConfig != NULL)
+        LockQueue(s->Connection->ReceivedBlocks);
         {
-            ret = c->MqttConfig;
+            BLOCK *b;
+            while ((b = GetNext(s->Connection->ReceivedBlocks)) != NULL)
+            {
+                FreeBlock(b);
+            }
         }
+        UnlockQueue(s->Connection->ReceivedBlocks);
+        ReleaseQueue(s->Connection->ReceivedBlocks);
+        
+        // 清理发送队列
+        LockQueue(s->Connection->SendBlocks);
+        {
+            BLOCK *b;
+            while ((b = GetNext(s->Connection->SendBlocks)) != NULL)
+            {
+                FreeBlock(b);
+            }
+        }
+        UnlockQueue(s->Connection->SendBlocks);
+        ReleaseQueue(s->Connection->SendBlocks);
     }
-    Unlock(c->lock);
-
-    return ret;
+    
+    Debug("MqttSessionThread: Session ended");
 }
 // Connect
 UINT CcConnect(REMOTE_CLIENT *r, RPC_CLIENT_CONNECT *connect)
 {
+	
     PACK *ret, *p;
     UINT err = 0;
+    const MQTT_CONFIG *mqtt_cfg;
+    CONNECTION *conn;
+    VH *v;
+    CEDAR *cedar;
+	SESSION *s;
+    THREAD *thread;
+    bool thread_init_ok = false;  
     // 验证参数
-    if (r == NULL || connect == NULL)
+    if (r == NULL || connect == NULL || r->Rpc == NULL)
     {
         return ERR_INTERNAL_ERROR;
     }
-
-    CcSetServiceToForegroundProcess(r);
-
-    p = NewPack();
-    OutRpcClientConnect(p, connect);
-
-    // 如果启用了MQTT，设置相关标志
-    if (GetCurrentMqttConfig() != NULL)
+	// 检查是否是MQTT连接
+    conn = (CONNECTION *)r;
+	s = conn->Session; 
+    if (conn->Protocol == CONNECTION_MQTT)
     {
-        PackAddBool(p, "use_mqtt", true);
-        PackAddStr(p, "mqtt_broker", GetCurrentMqttConfig()->broker);
-        PackAddInt(p, "mqtt_qos", GetCurrentMqttConfig()->qos);
+        // MQTT连接特有的线程创建
+        thread = NewThread(MqttSessionThread, s);
+        if (thread == NULL)
+        {
+            return ERR_INTERNAL_ERROR;
+        }
+
+        // 等待线程初始化
+        if (WaitThread(thread, INFINITE) == false)
+        {
+            ReleaseThread(thread);
+            return ERR_INTERNAL_ERROR;
+        }
+
+        // 保存线程引用
+        s->Thread = thread;
+        AddRef(thread->ref);
     }
-
-    ret = RpcCall(r->Rpc, "Connect", p);
-
-    if (RpcIsOk(ret) == false)
+	else
     {
-        err = RpcGetError(ret);
+        // 普通RPC连接的处理
+        if (r->Rpc == NULL)
+        {
+            return ERR_INTERNAL_ERROR;
+        }
+
+        CcSetServiceToForegroundProcess(r);
+        p = NewPack();
+        OutRpcClientConnect(p, connect);
+        ret = RpcCall(r->Rpc, "Connect", p);
+
+        if (RpcIsOk(ret) == false)
+        {
+            err = RpcGetError(ret);
+            Debug("CcConnect: RPC call failed with error %u\n", err);
+        }
+
+        FreePack(ret);
+        return err;
     }
-
-    FreePack(ret);
-
-    return err;
 }
 
 // Disconnect

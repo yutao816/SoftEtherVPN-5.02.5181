@@ -753,6 +753,7 @@ void OutRpcCmSetting(PACK *p, CM_SETTING *c);
 void InRpcCmSetting(CM_SETTING *c, PACK *p);
 void CiSetMqttConfig(CLIENT *c, char *broker, int qos);
 MQTT_CONFIG* CiGetMqttConfig(CLIENT *c);
+void MqttSessionThread(THREAD *thread, void *param);
 #ifdef OS_WIN32
 typedef struct MS_DRIVER_VER MS_DRIVER_VER;
 void CiInitDriverVerStruct(MS_DRIVER_VER *ver);

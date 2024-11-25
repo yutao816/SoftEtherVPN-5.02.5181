@@ -1116,6 +1116,27 @@ UINT GetQueueNum(QUEUE *q)
 // Get one
 void *GetNext(QUEUE *q)
 {
+	// 打开日志文件
+    FILE *fp = NULL;
+    fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        // 获取当前时间
+        time_t now;
+        struct tm *timeinfo;
+        char timestr[64];
+        
+        time(&now);
+        timeinfo = localtime(&now);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        // 写入测试数据
+        fprintf(fp, "[%s] CcConnect Test: getpacket\n", timestr);
+        fprintf(fp, "----------------------------------------\n");
+        
+        // 关闭文件
+        fclose(fp);
+    }
 	void *p = NULL;
 	// Validate arguments
 	if (q == NULL)

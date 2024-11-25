@@ -276,7 +276,7 @@ void CmdGenerateImportName(REMOTE_CLIENT *r, wchar_t *name, UINT size, wchar_t *
 bool CmdIsAccountName(REMOTE_CLIENT *r, wchar_t *name);
 wchar_t *GetSyslogSettingName(UINT n);
 
-
+bool SetupMqttConnection(CONNECTION *c);
 void TtPrint(void *param, TT_PRINT_PROC *print_proc, wchar_t *str);
 void TtGenerateRandomData(UCHAR **buf, UINT *size);
 void TtsWorkerThread(THREAD *thread, void *param);
@@ -382,6 +382,7 @@ UINT PcAccountRename(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 
 UINT PcMqttDisconnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 // UINT PcMqttStatus(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
+
 UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcAccountDisconnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
@@ -402,6 +403,7 @@ UINT PcKeepEnable(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcKeepDisable(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcKeepSet(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
 UINT PcKeepGet(CONSOLE *c, char *cmd_name, wchar_t *str, void *param);
+
 
 
 PS *NewPs(CONSOLE *c, RPC *rpc, char *servername, UINT serverport, char *hubname, char *adminhub, wchar_t *cmdline);

@@ -51,7 +51,7 @@ const MQTT_CONFIG* GetCurrentMqttConfig();
 bool ConnectMqttClient(CONNECTION* c);
 void ProcessMqttLoop(CONNECTION *c);
 void SendDataWithMQTT(CONNECTION *c);
-void ProcessMqttMessages(CONNECTION *c);
+void ProcessMqttMessages(CONNECTION *c, void *data, UINT size);
 void CleanupMqttConnection(CONNECTION *c);
 void GenerateRandomString(char *str, UINT size);
 bool InitMqttVpn();

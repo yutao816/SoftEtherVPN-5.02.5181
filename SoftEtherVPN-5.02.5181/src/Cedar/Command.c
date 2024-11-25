@@ -5,6 +5,7 @@
 // Command.c
 // vpncmd Command Line Management Utility
 
+#include "Cedar.h"
 #include "Command.h"
 
 #include "Admin.h"
@@ -22,6 +23,8 @@
 #include "Virtual.h"
 #include "WinUi.h"
 #include "../mqtt_vpn/mqtt_vpn.h"
+#include "Bridge.h"
+#include "Client.h"
 
 #include "Mayaqua/Cfg.h"
 #include "Mayaqua/FileIO.h"
@@ -42,6 +45,8 @@
 #include "Mayaqua/Crypto/Key.h"
 
 #include <stdlib.h>
+
+
 
 #ifdef OS_UNIX
 #include <signal.h>
@@ -6224,48 +6229,59 @@ UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
     LIST *o;
     PC *pc = (PC *)param;
     UINT ret = ERR_NO_ERROR;
+    RPC_CLIENT_CONNECT t;
     CEDAR *cedar;
     CLIENT_OPTION *option;
     CLIENT_AUTH *auth;
     PACKET_ADAPTER *pa;
     VH_OPTION *vh_option;
+	char *broker = NULL;
     
-    // 参数检查
+    // 1. 基础检查
     if (c == NULL || pc == NULL)
     {
         return ERR_INVALID_PARAMETER;
     }
 
-    // 检查MQTT状态
-    if (IsMqttConnected())
-    {
-        c->Write(c, _UU("CMD_MqttConnect_Already_Connected"));
-        return ERR_INTERNAL_ERROR;
-    }
-
-    // 确保已初始化
-    if (!InitMqttVpn())
-    {
-        c->Write(c, _UU("CMD_MqttConnect_Init_Failed"));
-        return ERR_INTERNAL_ERROR;
-    }
-    
-    // MQTT连接参数
+    // 2. 参数解析
     PARAM args[] =
     {
         {"[name]", CmdPrompt, _UU("CMD_AccountCreate_Prompt_Name"), CmdEvalNotEmpty, NULL},
         {"[broker]", CmdPrompt, _UU("CMD_MqttConnect_Prompt_Broker"), CmdEvalNotEmpty, NULL},
     };
 
-    // 获取参数列表
     o = ParseCommandList(c, cmd_name, str, args, sizeof(args) / sizeof(args[0]));
     if (o == NULL)
     {
         return ERR_INVALID_PARAMETER;
     }
 
-    // 设置MQTT配置
-    char *broker = GetParamStr(o, "[broker]");
+    // 3. 安全地获取参数
+    broker = GetParamStr(o, "[broker]");
+    if (broker == NULL)
+    {
+        // 清理资源
+        FreeParamValueList(o);
+        return ERR_INVALID_PARAMETER;
+    }
+
+    // 4. MQTT状态检查
+    if (IsMqttConnected())
+    {
+        c->Write(c, _UU("CMD_MqttConnect_Already_Connected"));
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 5. MQTT初始化
+    if (!InitMqttVpn())
+    {
+        c->Write(c, _UU("CMD_MqttConnect_Init_Failed"));
+        FreeParamValueList(o);
+        return ERR_INTERNAL_ERROR;
+    }
+
+    // 6. 设置MQTT配置
     if (!SetMqttConfig(broker))
     {
         c->Write(c, _UU("CMD_MqttConnect_Config_Failed"));
@@ -6273,23 +6289,17 @@ UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
         return ERR_INTERNAL_ERROR;
     }
 
-    // 创建新的Cedar实例
+    // 6. 创建Cedar实例
     cedar = NewCedar(NULL, NULL);
     if (cedar == NULL)
     {
-        FreeMqttVpn();
-        FreeParamValueList(o);
-        return ERR_INTERNAL_ERROR;
+        goto CLEANUP;
     }
 
-    // 创建客户端选项
+    // 7. 创建和配置选项
     option = ZeroMalloc(sizeof(CLIENT_OPTION));
-    
-    // 设置MQTT相关选项
     option->UseMqtt = true;
     option->RequireMqtt = true;
-    
-    // 设置基本连接选项
     option->RequireBridgeRoutingMode = true;
     option->NoUdpAcceleration = true;
     option->MaxConnection = 1;
@@ -6297,112 +6307,72 @@ UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
     option->UseCompress = true;
     option->NumRetry = INFINITE;
     option->RetryInterval = 15;
-    
-    // 设置账户名
     UniStrCpy(option->AccountName, sizeof(option->AccountName), GetParamUniStr(o, "[name]"));
 
-    // 创建认证信息
+    // 8. 创建认证信息
     auth = ZeroMalloc(sizeof(CLIENT_AUTH));
     auth->AuthType = CLIENT_AUTHTYPE_ANONYMOUS;
 
-    // 创建虚拟主机选项
+    // 9. 创建虚拟主机选项
     vh_option = ZeroMalloc(sizeof(VH_OPTION));
     vh_option->UseNat = true;
     vh_option->UseDhcp = true;
 
-    // 创建虚拟网卡适配器
+    // 10. 创建虚拟主机
     VH *v = NewVirtualHost(cedar, option, auth, vh_option);
     if (v == NULL)
     {
-        FreeMqttVpn();
-        Free(vh_option);
-        Free(auth);
-        Free(option);
-        ReleaseCedar(cedar);
-        FreeParamValueList(o);
-        return ERR_INTERNAL_ERROR;
+        goto CLEANUP;
     }
 
-    // 获取虚拟网卡适配器
+    // 11. 获取虚拟网卡适配器
     pa = VirtualGetPacketAdapter();
     if (pa == NULL)
     {
-        FreeMqttVpn();
-        CleanupVirtual(v);
-        Free(vh_option);
-        Free(auth);
-        Free(option);
-        ReleaseCedar(cedar);
-        FreeParamValueList(o);
-        return ERR_INTERNAL_ERROR;
+        goto CLEANUP;
     }
-
-    // 设置PacketAdapter的参数
     pa->Param = v;
 
-    // 创建Session，传入所有必要参数
+    // 12. 创建会话
     SESSION *s = NewClientSession(cedar, option, auth, pa);
     if (s == NULL)
     {
-        FreeMqttVpn();
-        CleanupVirtual(v);
-        Free(vh_option);
-        Free(auth);
-        Free(option);
-        ReleaseCedar(cedar);
-        FreeParamValueList(o);
-        return ERR_INTERNAL_ERROR;
+        goto CLEANUP;
     }
-
-    // 设置Session的VirtualHost标志
     s->VirtualHost = true;
 
-    // 创建Connection
+    // 13. 创建连接
     CONNECTION *conn = NewClientConnection(s);
     if (conn == NULL)
     {
-        ReleaseSession(s);
-        FreeMqttVpn();
-        CleanupVirtual(v);
-        Free(vh_option);
-        Free(auth);
-        Free(option);
-        ReleaseCedar(cedar);
-        FreeParamValueList(o);
-        return ERR_INTERNAL_ERROR;
+        goto CLEANUP;
     }
-
-    // 设置为MQTT协议
     conn->Protocol = CONNECTION_MQTT;
+    pc->RemoteClient = (REMOTE_CLIENT *)conn;
+	s->Connection = conn;
 
-    // // 生成随机主题
-    // char random_suffix[33];
-    // GenerateRandomString(random_suffix, sizeof(random_suffix));
-    // Format(conn->MqttTopic, sizeof(conn->MqttTopic), "%s/%s", TOPIC_PRE, random_suffix);
-
-    // 订阅主题
+    // 14. 订阅MQTT主题
     if (!SubscribeMqttTopic(conn, conn->MqttTopic))
     {
         c->Write(c, _UU("CMD_MqttConnect_Subscribe_Failed"));
-        CleanupMqttConnection(conn);
-        ReleaseConnection(conn);
-        ReleaseSession(s);
-        FreeMqttVpn();
-        CleanupVirtual(v);
-        Free(vh_option);
-        Free(auth);
-        Free(option);
-        ReleaseCedar(cedar);
-        FreeParamValueList(o);
-        return ERR_INTERNAL_ERROR;
+        goto CLEANUP;
+    }
+    SetMqttConnected(conn, true);
+
+    // 15. 准备连接参数
+    Zero(&t, sizeof(t));
+    UniStrCpy(t.AccountName, sizeof(t.AccountName), GetParamUniStr(o, "[name]"));
+
+    // 16. 启动连接
+    ret = CcConnect(pc->RemoteClient, &t);
+    if (ret != ERR_NO_ERROR)
+    {
+        c->Write(c, _UU("CMD_MqttConnect_Failed"));
+        goto CLEANUP;
     }
 
-
-
-    // 连接成功
+    // 17. 显示成功信息
     c->Write(c, _UU("CMD_MqttConnect_Success"));
-    
-    // 显示连接信息
     const MQTT_CONFIG* mqtt_config = GetCurrentMqttConfig();
     if (mqtt_config != NULL)
     {
@@ -6412,136 +6382,169 @@ UINT PcMqttConnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
         c->Write(c, tmp);
     }
 
-    // 保存连接到PC
-    pc->RemoteClient = conn;
-	// 连接成功后设置状态
-    SetMqttConnected(conn, true);
-
-
+    FreeParamValueList(o);
     return ERR_NO_ERROR;
+
+CLEANUP:
+    if (conn != NULL) CleanupMqttConnection(conn);
+    if (s != NULL) ReleaseSession(s);
+    if (v != NULL) CleanupVirtual(v);
+    if (vh_option != NULL) Free(vh_option);
+    if (auth != NULL) Free(auth);
+    if (option != NULL) Free(option);
+    if (cedar != NULL) ReleaseCedar(cedar);
+    FreeMqttVpn();
+    FreeParamValueList(o);
+    return ERR_INTERNAL_ERROR;
 }
 // MQTT断开连接命令
 UINT PcMqttDisconnect(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
 {
     PC *pc = (PC *)param;
+    SESSION *session = NULL;
+    CEDAR *cedar = NULL;
+    VH *virtual_host = NULL;
+    CLIENT_OPTION *option = NULL;
+    CLIENT_AUTH *auth = NULL;
+    PACKET_ADAPTER *pa = NULL;
     
-    // 参数检查
+    // 1. 参数检查
     if (c == NULL || pc == NULL)
     {
         return ERR_INVALID_PARAMETER;
     }
 
-    // 检查是否有活动的MQTT连接
-    CONNECTION *conn = pc->RemoteClient;
+    // 2. 检查MQTT连接状态
+    CONNECTION *conn = (CONNECTION *)pc->RemoteClient;
     if (conn == NULL || conn->Protocol != CONNECTION_MQTT)
     {
         c->Write(c, _UU("CMD_MqttDisconnect_No_Connection"));
         return ERR_INTERNAL_ERROR;
     }
 
-    // 取消订阅主题
-    if (conn->MqttTopic[0] != '\0')
+    // 3. 保存必要的引用
+    session = conn->Session;
+    if (session != NULL)
     {
-        UnsubscribeMqttTopic(conn, conn->MqttTopic);
+        cedar = session->Cedar;
+        option = session->ClientOption;
+        auth = session->ClientAuth;
+        pa = session->PacketAdapter;
+        
+        if (session->VirtualHost && pa != NULL)
+        {
+            virtual_host = (VH*)pa->Param;
+        }
     }
 
-    // 断开MQTT连接
-    DisconnectMqttClient(conn);
-
-    // 清理连接资源
-    if (conn->Session != NULL)
+    // 4. 停止会话线程
+    if (session != NULL && session->Thread != NULL)
     {
-        ReleaseSession(conn->Session);
+        
+        WaitThread(session->Thread, INFINITE);
+        ReleaseThread(session->Thread);
+        session->Thread = NULL;
     }
-    ReleaseConnection(conn);
-    pc->RemoteClient = NULL;
 
-    // 释放MQTT资源
+    // 5. 清理MQTT相关资源
+    if (conn != NULL)
+    {
+        // 取消MQTT订阅
+        if (conn->MqttTopic[0] != '\0')
+        {
+            UnsubscribeMqttTopic(conn, conn->MqttTopic);
+        }
+        
+        // 断开MQTT客户端
+        DisconnectMqttClient(conn);
+        
+        // 清理数据队列
+        if (conn->ReceivedBlocks)
+        {
+            LockQueue(conn->ReceivedBlocks);
+            {
+                BLOCK *b;
+                while ((b = GetNext(conn->ReceivedBlocks)) != NULL)
+                {
+                    FreeBlock(b);
+                }
+            }
+            UnlockQueue(conn->ReceivedBlocks);
+            ReleaseQueue(conn->ReceivedBlocks);
+            conn->ReceivedBlocks = NULL;
+        }
+        
+        if (conn->SendBlocks)
+        {
+            LockQueue(conn->SendBlocks);
+            {
+                BLOCK *b;
+                while ((b = GetNext(conn->SendBlocks)) != NULL)
+                {
+                    FreeBlock(b);
+                }
+            }
+            UnlockQueue(conn->SendBlocks);
+            ReleaseQueue(conn->SendBlocks);
+            conn->SendBlocks = NULL;
+        }
+    }
+
+    // 6. 清理虚拟网络相关资源
+    if (virtual_host != NULL)
+    {
+       
+        CleanupVirtual(virtual_host);
+        virtual_host = NULL;
+    }
+
+    // 7. 清理PacketAdapter
+    if (pa != NULL)
+    {
+        if (pa->Free != NULL)
+        {
+            pa->Free(session);
+        }
+        FreePacketAdapter(pa);
+        session->PacketAdapter = NULL;
+    }
+
+    // 8. 清理认证和选项
+    if (auth != NULL)
+    {
+        Free(auth);
+    }
+    if (option != NULL)
+    {
+        Free(option);
+    }
+
+    // 9. 释放会话
+    if (session != NULL)
+    {
+        ReleaseSession(session);
+    }
+
+    // 10. 释放连接
+    if (conn != NULL)
+    {
+        ReleaseConnection(conn);
+        pc->RemoteClient = NULL;
+    }
+
+    // 11. 释放Cedar
+    if (cedar != NULL)
+    {
+        ReleaseCedar(cedar);
+    }
+
+    // 12. 释放MQTT全局资源
     FreeMqttVpn();
+    SetMqttConnected(NULL, false);
 
-    c->Write(c, _UU("CMD_MqttDisconnect_Success"));
     return ERR_NO_ERROR;
 }
 
-// MQTT状态查询命令
-// UINT PcMqttStatus(CONSOLE *c, char *cmd_name, wchar_t *str, void *param)
-// {
-//     PC *pc = (PC *)param;
-//     CT *ct;
-//     wchar_t tmp[MAX_SIZE];
-    
-//     // 参数检查
-//     if (c == NULL || pc == NULL)
-//     {
-//         return ERR_INVALID_PARAMETER;
-//     }
-
-//     // 创建表格
-//     ct = CtNew();
-//     CtInsertColumn(ct, _UU("CMD_MqttStatus_Column_1"), false);
-//     CtInsertColumn(ct, _UU("CMD_MqttStatus_Column_2"), false);
-
-//     // 获取当前MQTT配置
-//     const MQTT_CONFIG* mqtt_config = GetCurrentMqttConfig();
-//     CONNECTION *conn = pc->RemoteClient;
-
-//     // 连接状态
-//     CtInsert(ct, _UU("CMD_MqttStatus_Status"),
-//         (conn != NULL && conn->Protocol == CONNECTION_MQTT && IsMqttConnected(conn)) ? 
-//         _UU("CMD_MqttStatus_Connected") : _UU("CMD_MqttStatus_Disconnected"));
-
-//     if (mqtt_config != NULL)
-//     {
-//         // Broker地址
-//         StrToUni(tmp, sizeof(tmp), mqtt_config->broker);
-//         CtInsert(ct, _UU("CMD_MqttStatus_Broker"), tmp);
-
-//         // QoS级别
-//         UniFormat(tmp, sizeof(tmp), L"%d", mqtt_config->qos);
-//         CtInsert(ct, _UU("CMD_MqttStatus_QoS"), tmp);
-
-//         // TLS状态
-//         CtInsert(ct, _UU("CMD_MqttStatus_TLS"),
-//             mqtt_config->use_tls ? _UU("CMD_MqttStatus_Enabled") : _UU("CMD_MqttStatus_Disabled"));
-//     }
-
-//     // 如果已连接，显示更多信息
-//     if (conn != NULL && conn->Protocol == CONNECTION_MQTT && IsMqttConnected(conn))
-//     {
-//         // 显示主题
-//         if (conn->MqttTopic[0] != '\0')
-//         {
-//             StrToUni(tmp, sizeof(tmp), conn->MqttTopic);
-//             CtInsert(ct, _UU("CMD_MqttStatus_Topic"), tmp);
-//         }
-
-//         // 显示客户端ID
-//         if (mqtt_config && mqtt_config->client_id[0] != '\0')
-//         {
-//             StrToUni(tmp, sizeof(tmp), mqtt_config->client_id);
-//             CtInsert(ct, _UU("CMD_MqttStatus_ClientId"), tmp);
-//         }
-
-//         // 显示连接时长
-//         if (conn->ConnectedTick != 0)
-//         {
-//             GetDateTimeStrEx64(tmp, sizeof(tmp), Tick64() - conn->ConnectedTick, NULL);
-//             CtInsert(ct, _UU("CMD_MqttStatus_ConnectedTime"), tmp);
-//         }
-
-//         // 显示数据统计
-//         if (conn->ReceivedBlocks && conn->SendBlocks)
-//         {
-//             UniFormat(tmp, sizeof(tmp), L"%u", GetQueueNum(conn->ReceivedBlocks));
-//             CtInsert(ct, _UU("CMD_MqttStatus_ReceivedPackets"), tmp);
-
-//             UniFormat(tmp, sizeof(tmp), L"%u", GetQueueNum(conn->SendBlocks));
-//             CtInsert(ct, _UU("CMD_MqttStatus_SendPackets"), tmp);
-//         }
-//     }
-
-//     // 显示表格
-//     CtFree(ct, c);
 
 //     return ERR_NO_ERROR;
 // }
@@ -8094,11 +8097,7 @@ void PsMain(PS *ps)
 
 		if (DispatchNextCmdEx(ps->Console, ps->CmdLine, prompt, cmd, sizeof(cmd) / sizeof(cmd[0]), ps) == false)
 		{
-			if (pc->IsPersistentConnection)
-        {
-            // 如果是持久连接，继续等待命令
-            continue;
-        }
+		
 			break;
 		}
 		ps->LastError = ps->Console->RetCode;

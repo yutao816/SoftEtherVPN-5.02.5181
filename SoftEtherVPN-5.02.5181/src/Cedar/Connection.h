@@ -19,10 +19,7 @@
 #define	KEEP_ALIVE_STRING				"Internet Connection Keep Alive Packet"
 
 #define	UPDATE_LAST_COMM_TIME(v, n)		{if ((v) <= (n)) { v = (n); } }
-// 连接协议类型
-#define CONNECTION_TCP    0
-#define CONNECTION_UDP    1
-#define CONNECTION_MQTT   2   // 添加MQTT协议类型
+
 
 // KEEP CONNECT structure
 struct KEEP
@@ -255,11 +252,13 @@ struct CONNECTION
 	LISTENER *Listener;				// Listener ref
 	bool UseMqtt;                   // Flag to indicate if MQTT is used
 	void *MQTTClient;                  // MQTT客户端句柄
-    char MqttTopic[MAX_PATH];          // MQTT主题
-    UINT MqttQoS;                      // MQTT QoS级别
     bool IsMqttEnabled;
 	bool IsInPacket;                        // 标识数据包方向：true=接收数据包，false=发送数据包
 	// QUEUE* SendBlocks;        // 发送队列
+	UINT64 MqttSeq;       // MQTT发送序列号
+    UINT64 MqttRecvSeq;   // MQTT接收序列号
+    UINT MqttQoS;         // MQTT服务质量
+    char *MqttTopic[128];      // MQTT主题
 };
 
 

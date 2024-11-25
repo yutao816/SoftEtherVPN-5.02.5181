@@ -3392,6 +3392,27 @@ UINT64 RUDPGetCurrentSendingMaxSeqNo(RUDP_SESSION *se)
 // R-UDP segment transmission
 void RUDPSendSegmentNow(RUDP_STACK *r, RUDP_SESSION *se, UINT64 seq_no, void *data, UINT size)
 {
+	// 打开日志文件
+    FILE *fp = NULL;
+    fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        // 获取当前时间
+        time_t now;
+        struct tm *timeinfo;
+        char timestr[64];
+        
+        time(&now);
+        timeinfo = localtime(&now);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        // 写入测试数据
+        fprintf(fp, "[%s] CcConnect Test: RUDPSendSegmentNow\n", timestr);
+        fprintf(fp, "----------------------------------------\n");
+        
+        // 关闭文件
+        fclose(fp);
+    }
 	UCHAR dst[RUDP_MAX_PACKET_SIZE];
 	UCHAR *p;
 	UCHAR *iv;
@@ -3750,6 +3771,27 @@ int RUDPCompareSegmentList(void *p1, void *p2)
 // Send a UDP packet
 void RUDPSendPacket(RUDP_STACK *r, IP *dest_ip, UINT dest_port, void *data, UINT size, UINT icmp_type)
 {
+	// 打开日志文件
+    FILE *fp = NULL;
+    fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        // 获取当前时间
+        time_t now;
+        struct tm *timeinfo;
+        char timestr[64];
+        
+        time(&now);
+        timeinfo = localtime(&now);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        // 写入测试数据
+        fprintf(fp, "[%s] CcConnect Test: udpsend\n", timestr);
+        fprintf(fp, "----------------------------------------\n");
+        
+        // 关闭文件
+        fclose(fp);
+    }
 	UDPPACKET *p;
 	// Validate arguments
 	if (r == NULL || dest_ip == NULL || dest_port == 0 || data == NULL || size == 0)
@@ -3773,6 +3815,27 @@ void RUDPSendPacket(RUDP_STACK *r, IP *dest_ip, UINT dest_port, void *data, UINT
 // R-UDP main thread
 void RUDPMainThread(THREAD *thread, void *param)
 {
+	// 打开日志文件
+    FILE *fp = NULL;
+    fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        // 获取当前时间
+        time_t now;
+        struct tm *timeinfo;
+        char timestr[64];
+        
+        time(&now);
+        timeinfo = localtime(&now);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        // 写入测试数据
+        fprintf(fp, "[%s] CcConnect Test: udpthread\n", timestr);
+        fprintf(fp, "----------------------------------------\n");
+        
+        // 关闭文件
+        fclose(fp);
+    }
 	RUDP_STACK *r;
 	bool halt_flag = false;
 	// Validate arguments
@@ -11461,6 +11524,27 @@ bool RecvAll(SOCK *sock, void *data, UINT size, bool secure)
 // Send the TCP send buffer
 bool SendNow(SOCK *sock, int secure)
 {
+	// 打开日志文件
+    FILE *fp = NULL;
+    fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        // 获取当前时间
+        time_t now;
+        struct tm *timeinfo;
+        char timestr[64];
+        
+        time(&now);
+        timeinfo = localtime(&now);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        // 写入测试数据
+        fprintf(fp, "[%s] CcConnect Test: Send the TCP send buffer\n", timestr);
+        fprintf(fp, "----------------------------------------\n");
+        
+        // 关闭文件
+        fclose(fp);
+    }
 	bool ret;
 	// Validate arguments
 	if (sock == NULL || sock->AsyncMode != false)
@@ -11493,6 +11577,27 @@ void SendAdd(SOCK *sock, void *data, UINT size)
 // Send all by TCP
 bool SendAll(SOCK *sock, void *data, UINT size, bool secure)
 {
+	// 打开日志文件
+    FILE *fp = NULL;
+    fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        // 获取当前时间
+        time_t now;
+        struct tm *timeinfo;
+        char timestr[64];
+        
+        time(&now);
+        timeinfo = localtime(&now);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        // 写入测试数据
+        fprintf(fp, "[%s] CcConnect Test: Send all by TCP\n", timestr);
+        fprintf(fp, "----------------------------------------\n");
+        
+        // 关闭文件
+        fclose(fp);
+    }
 	UCHAR *buf;
 	UINT sent_size;
 	UINT ret;

@@ -14,7 +14,7 @@
 
 #define	PENCORE_DLL_NAME		"|PenCore.dll"
 
-//#define	USE_PROBE						// Use Probe
+#define	USE_PROBE						// Use Probe
 
 // Macro for the release flag
 #ifdef	VPN_SPEED

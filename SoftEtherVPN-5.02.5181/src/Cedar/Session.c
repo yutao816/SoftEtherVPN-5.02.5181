@@ -61,11 +61,30 @@ void SessionMain(SESSION *s)
 	bool is_server_session = false;
 	bool lock_receive_blocks_queue = false;
 	UINT static_ip = 0;
-
-	// 添加MQTT处理
+	// 仅在使用 MQTT 连接时赋值
     if (s->Connection != NULL && s->Connection->Protocol == CONNECTION_MQTT)
     {
-        ProcessMqttLoop(s->Connection);
+        c = s->Connection;
+    }
+
+    if (c->Protocol == CONNECTION_MQTT)
+    {
+        while (true)
+        {
+            if (s->Halt)
+            {
+                break;
+            }
+
+            // 使用 ProcessMqttLoop 处理 MQTT 逻辑
+            ProcessMqttLoop(c);
+
+            // 短暂休眠
+            SleepThread(10);
+        }
+
+        // 断开MQTT连接
+        DisconnectMqttClient(c);
     }
 
 
@@ -406,6 +425,7 @@ void SessionMain(SESSION *s)
 			while (packet_size = pa->GetNextPacket(s, &packet))
 			{
 				BLOCK *b;
+				Debug("Outgoing Packet - Size: %u bytes\n", packet_size);
 				if (packet_size == INFINITE)
 				{
 					err = ERR_DEVICE_DRIVER_ERROR;
@@ -1913,14 +1933,14 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 {
 	SESSION *s;
 	THREAD *t;
-	// Validate arguments
+	// 验证参数
 	if (cedar == NULL || option == NULL || auth == NULL || pa == NULL ||
 		(auth->AuthType == CLIENT_AUTHTYPE_SECURE && auth->SecureSignProc == NULL))
 	{
 		return NULL;
 	}
 
-	// Initialize the SESSION object
+	// 初始化 SESSION 对象
 	s = ZeroMalloc(sizeof(SESSION));
 
 	s->LoggingRecordCount = NewCounter();
@@ -1939,7 +1959,7 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 	s->Cancel1 = NewCancel();
 	s->CancelList = NewCancelList();
 
-	// Copy the client connection options
+	// 复制客户端连接选项
 	s->ClientOption = Malloc(sizeof(CLIENT_OPTION));
 	Copy(s->ClientOption, option, sizeof(CLIENT_OPTION));
 
@@ -1954,14 +1974,14 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 	s->UseEncrypt = option->UseEncrypt;
 	s->UseCompress = option->UseCompress;
 
-	// Set the retry interval
+	// 设置重试间隔
 	s->RetryInterval = MAKESURE(option->RetryInterval, 0, 4000000) * 1000;
 	s->RetryInterval = MAKESURE(s->RetryInterval, MIN_RETRY_INTERVAL, MAX_RETRY_INTERVAL);
 
-	// Interval for additional connection creation is at least 1 second
+	// 额外连接创建的间隔至少为1秒
 	s->ClientOption->AdditionalConnectionInterval = MAX(s->ClientOption->AdditionalConnectionInterval, 1);
 
-	// Hold whether the virtual LAN card is used in client mode
+	// 保存客户端模式下是否使用虚拟网卡的状态
 	s->ClientModeAndUseVLan = (StrLen(s->ClientOption->DeviceName) == 0) ? false : true;
 
 	if (s->ClientOption->NoRoutingTracking)
@@ -1976,16 +1996,16 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 
 	if (StrLen(option->DeviceName) == 0)
 	{
-		// NAT mode
+		// NAT 模式
 		s->ClientModeAndUseVLan = false;
 		s->VirtualHost = true;
 	}
 
-	// Copy the client authentication data
+	// 复制客户端认证数据
 	s->ClientAuth = Malloc(sizeof(CLIENT_AUTH));
 	Copy(s->ClientAuth, auth, sizeof(CLIENT_AUTH));
 
-	// Clone the certificate and the private key
+	// 克隆证书和私钥
 	if (s->ClientAuth->ClientX != NULL)
 	{
 		s->ClientAuth->ClientX = CloneX(s->ClientAuth->ClientX);
@@ -2004,19 +2024,19 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 
 	if (StrCmpi(s->ClientOption->DeviceName, LINK_DEVICE_NAME) == 0)
 	{
-		// Link client mode
+		// Link 客户端模式
 		s->LinkModeClient = true;
 		s->Link = (LINK *)s->PacketAdapter->Param;
 		if (s->Link != NULL && s->Link->CheckServerCert && s->Link->Hub->HubDb != NULL)
 		{
-			// Enable SSL peer verification
+			// 启用 SSL 对等验证
 			s->SslOption = ZeroMalloc(sizeof(SSL_VERIFY_OPTION));
 			s->SslOption->VerifyPeer = true;
 			s->SslOption->AddDefaultCA = s->Link->AddDefaultCA;
 			s->SslOption->VerifyHostname = true;
 			s->SslOption->SavedCert = CloneX(s->Link->ServerCert);
 
-			// Copy trusted CA
+			// 复制受信任的 CA
 			LIST *o = s->Link->Hub->HubDb->RootCertList;
 			s->SslOption->CaList = CloneXList(o);
 		}
@@ -2025,7 +2045,7 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 	{
 		if (account != NULL && account->CheckServerCert)
 		{
-			// Enable SSL peer verification
+			// 启用 SSL 对等验证
 			s->SslOption = ZeroMalloc(sizeof(SSL_VERIFY_OPTION));
 			s->SslOption->VerifyPeer = true;
 #ifdef	OS_WIN32
@@ -2035,7 +2055,7 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 			s->SslOption->VerifyHostname = true;
 			s->SslOption->SavedCert = CloneX(account->ServerCert);
 
-			// Copy trusted CA
+			// 复制受信任的 CA
 			LIST *o = cedar->CaList;
 			s->SslOption->CaList = CloneXList(o);
 		}
@@ -2043,13 +2063,13 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 
 	if (StrCmpi(s->ClientOption->DeviceName, SNAT_DEVICE_NAME) == 0)
 	{
-		// SecureNAT mode
+		// SecureNAT 模式
 		s->SecureNATMode = true;
 	}
 
 	if (StrCmpi(s->ClientOption->DeviceName, BRIDGE_DEVICE_NAME) == 0)
 	{
-		// Bridge mode
+		// Bridge 模式
 		s->BridgeMode = true;
 	}
 
@@ -2057,7 +2077,7 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 	{
 		VH *v = (VH *)s->PacketAdapter->Param;
 
-		// Add the session object to VH
+		// 将会话对象添加到 VH
 		v->Session = s;
 		AddRef(s->ref);
 	}
@@ -2066,14 +2086,16 @@ SESSION *NewClientSessionEx(CEDAR *cedar, CLIENT_OPTION *option, CLIENT_AUTH *au
 
 	if (s->ClientAuth->AuthType == CLIENT_AUTHTYPE_SECURE)
 	{
-		// Do not retry in the case of a smart card authentication
+		// 智能卡认证的情况下不进行重试
 		s->ClientOption->NumRetry = 0;
 	}
 
-	// Create a client thread
-	t = NewThread(ClientThread, (void *)s);
-	WaitThreadInit(t);
-	ReleaseThread(t);
+	if (!option->UseMqtt)  // 使用现有的UseMqtt字段
+    {
+        t = NewThread(ClientThread, (void *)s);
+        WaitThreadInit(t);
+        ReleaseThread(t);
+    }
 
 	return s;
 }

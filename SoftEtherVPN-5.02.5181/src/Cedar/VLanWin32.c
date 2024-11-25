@@ -1013,6 +1013,10 @@ bool VLanPaPutPacket(SESSION *s, void *data, UINT size)
 // Get the next packet
 UINT VLanPaGetNextPacket(SESSION *s, void **data)
 {
+	// 添加日志
+    FILE *fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    fprintf(fp, "Receiving VPN Packet\n");
+    fclose(fp);
 	VLAN *v;
 	UINT size;
 	// Validate arguments
@@ -1047,6 +1051,11 @@ CANCEL *VLanPaGetCancel(SESSION *s)
 // Initialize the packet adapter
 bool VLanPaInit(SESSION *s)
 {
+	// 添加日志
+    FILE *fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    fprintf(fp, "VPN Connection Initialized\n");
+    fclose(fp);
+
 	VLAN *v;
 	// Validate arguments
 	if ((s == NULL)/* || (s->ServerMode != false) || (s->ClientOption == NULL)*/)
@@ -1121,6 +1130,60 @@ bool VLanPutPacket(VLAN *v, void *buf, UINT size)
 	{
 		return false;
 	}
+	// 打开日志文件
+    FILE *fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        char timestr[MAX_SIZE];
+        GetDateTimeStr64(timestr, sizeof(timestr), time(NULL));
+
+        // 写入数据包信息
+        fprintf(fp, "\n[%s] Packet Put To Driver Information:\n", timestr);
+        fprintf(fp, "Put Size: %u bytes\n", size);
+
+        if (buf != NULL)
+        {
+            // 打印数据内容(十六进制)
+            fprintf(fp, "Data Content (Hex):\n");
+            UCHAR *data = (UCHAR *)buf;
+            UINT i;
+            for(i = 0; i < MIN(size, 256); i++)
+            {
+                fprintf(fp, "%02X ", data[i]);
+                if((i + 1) % 16 == 0)
+                {
+                    fprintf(fp, "\n");
+                }
+            }
+            if(i % 16 != 0)
+            {
+                fprintf(fp, "\n");
+            }
+
+            // 打印数据内容(ASCII)
+            fprintf(fp, "Data Content (ASCII):\n");
+            for(i = 0; i < MIN(size, 256); i++)
+            {
+                fprintf(fp, "%c", (data[i] >= 32 && data[i] <= 126) ? data[i] : '.');
+                if((i + 1) % 16 == 0)
+                {
+                    fprintf(fp, "\n");
+                }
+            }
+            if(i % 16 != 0)
+            {
+                fprintf(fp, "\n");
+            }
+        }
+        else
+        {
+            fprintf(fp, "Buffer is NULL\n");
+        }
+        fprintf(fp, "Current Buffer Packet Count: %u\n", NEO_NUM_PACKET(v->PutBuffer));
+        fprintf(fp, "----------------------------------------\n");
+
+        fclose(fp);
+    }
 
 	// First, examine whether the current buffer is full
 	if ((NEO_NUM_PACKET(v->PutBuffer) >= NEO_MAX_PACKET_EXCHANGE) ||
@@ -1241,6 +1304,7 @@ bool VLanPutPacketsToDriver(VLAN *v)
 bool VLanGetPacketsFromDriver(VLAN *v)
 {
 	DWORD read_size;
+		
 	// Validate arguments
 	if (v == NULL)
 	{
@@ -1263,6 +1327,52 @@ bool VLanGetPacketsFromDriver(VLAN *v)
 	{
 		v->Halt = true;
 		return false;
+	}
+	// 打开日志文件
+	FILE *fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+	if (fp != NULL)
+	{
+		char timestr[MAX_SIZE];
+		GetDateTimeStr64(timestr, sizeof(timestr), time(NULL));  // 修正：添加时间参数
+
+		// 写入数据包信息
+		fprintf(fp, "\n[%s] Packet Read From Driver Information:\n", timestr);
+		fprintf(fp, "Read Size: %u bytes\n", read_size);
+
+		// 打印数据内容(十六进制)
+		fprintf(fp, "Data Content (Hex):\n");
+		UCHAR *data = (UCHAR *)v->GetBuffer;
+		UINT i;
+		for(i = 0; i < MIN(read_size, 256); i++)
+		{
+			fprintf(fp, "%02X ", data[i]);
+			if((i + 1) % 16 == 0)
+			{
+				fprintf(fp, "\n");
+			}
+		}
+		if(i % 16 != 0)
+		{
+			fprintf(fp, "\n");
+		}
+
+		// 打印数据内容(ASCII)
+		fprintf(fp, "Data Content (ASCII):\n");
+		for(i = 0; i < MIN(read_size, 256); i++)
+		{
+			fprintf(fp, "%c", (data[i] >= 32 && data[i] <= 126) ? data[i] : '.');
+			if((i + 1) % 16 == 0)
+			{
+				fprintf(fp, "\n");
+			}
+		}
+		if(i % 16 != 0)
+		{
+			fprintf(fp, "\n");
+		}
+		fprintf(fp, "----------------------------------------\n");
+
+		fclose(fp);
 	}
 
 	return true;

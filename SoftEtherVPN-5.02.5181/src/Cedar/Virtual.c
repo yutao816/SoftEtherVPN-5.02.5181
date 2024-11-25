@@ -9893,6 +9893,27 @@ bool VirtualLayer2Filter(VH *v, PKT *packet)
 // The virtual host is made to receive a packet
 bool VirtualPutPacket(VH *v, void *data, UINT size)
 {
+	// 打开日志文件
+    FILE *fp = NULL;
+    fp = fopen("C:\\Users\\Administrator\\Desktop\\dyrz\\mqtt_packet.log", "a");
+    if (fp != NULL)
+    {
+        // 获取当前时间
+        time_t now;
+        struct tm *timeinfo;
+        char timestr[64];
+        
+        time(&now);
+        timeinfo = localtime(&now);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        // 写入测试数据
+        fprintf(fp, "[%s] CcConnect Test: xuniwangka test\n", timestr);
+        fprintf(fp, "----------------------------------------\n");
+        
+        // 关闭文件
+        fclose(fp);
+    }
     // 基本参数检查
     if (v == NULL || data == NULL)
     {

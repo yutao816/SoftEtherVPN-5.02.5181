@@ -26,6 +26,7 @@
 #include "../Cedar/CedarType.h"
 #include "../Cedar/Nat.h"
 #include "../Mayaqua/Network.h"  // 包含IP相关函数的头文件
+#include "Mayaqua/Tick64.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -176,40 +177,22 @@ bool GetMqttUserInput(char* broker, UINT broker_size)
     return true;
 }
 
-// 生成MQTT主题
-bool GenerateMqttTopic(CONNECTION *c)
-{
-    if (c == NULL)
-    {
-        return false;
-    }
 
-    // 生成6位随机字符串作为主题后缀
-    char suffix[7];  // 6位随机字符 + 1位结束符
-    UCHAR rand_data[3];  // 需要3字节来生成6位十六进制字符串
-    
-    Rand(rand_data, sizeof(rand_data));
-    BinToStr(suffix, sizeof(suffix), rand_data, sizeof(rand_data));
-    
-    // 格式化主题: vpn/XXXXXX
-    Format(c->MqttTopic, sizeof(c->MqttTopic), "%s/%s", TOPIC_PRE, suffix);
-    
-    Debug("MQTT: Generated topic: %s", c->MqttTopic);
-    return true;
-}
 
 // 订阅MQTT主题
 bool SubscribeMqttTopic(CONNECTION* c, const char* topic)
 {
-    if (c == NULL || c->MQTTClient == NULL || topic == NULL)
+    // 首先验证连接参数
+    if (c == NULL || c->MQTTClient == NULL)
     {
-        Debug("MQTT: Invalid parameters for topic subscription");
+        Debug("MQTT: Invalid connection parameters");
         return false;
     }
 
-    // 生成并设置主题（如果未指定）
+    // 检查主题是否为空，如果为空则生成新主题
     if (IsEmptyStr(topic))
     {
+        Debug("MQTT: No topic specified, generating new topic");
         if (!GenerateMqttTopic(c))
         {
             Debug("MQTT: Failed to generate topic");
@@ -218,6 +201,14 @@ bool SubscribeMqttTopic(CONNECTION* c, const char* topic)
         topic = c->MqttTopic;
     }
 
+    // 再次验证主题
+    if (IsEmptyStr(topic))
+    {
+        Debug("MQTT: Topic is still empty after generation attempt");
+        return false;
+    }
+
+    // 订阅主题
     int rc = MQTTClient_subscribe((MQTTClient)c->MQTTClient, topic, c->MqttQoS);
     if (rc != MQTTCLIENT_SUCCESS)
     {
@@ -228,7 +219,31 @@ bool SubscribeMqttTopic(CONNECTION* c, const char* topic)
     Debug("MQTT: Successfully subscribed to topic: %s", topic);
     return true;
 }
+// 生成MQTT主题
+bool GenerateMqttTopic(CONNECTION *c)
+{
+    if (c == NULL)
+    {
+        return false;
+    }
 
+    // 使用时间戳和随机数生成主题
+    UINT64 timestamp = SystemTime64();
+    UINT random_num;
+    Rand(&random_num, sizeof(random_num));
+    
+    // 组合时间戳和随机数的后4位生成主题
+    char topic_id[11];  // 10位数字 + 1位结束符
+    Format(topic_id, sizeof(topic_id), "%06u%04u", 
+           (UINT)(timestamp % 1000000), 
+           random_num % 10000);
+    
+    // 格式化完整主题
+    Format(c->MqttTopic, sizeof(c->MqttTopic), "%s/%s", TOPIC_PRE, topic_id);
+    
+    Debug("MQTT: Generated topic: %s", c->MqttTopic);
+    return true;
+}
 // 取消订阅MQTT主题
 bool UnsubscribeMqttTopic(CONNECTION* c, const char* topic)
 {
@@ -252,24 +267,13 @@ bool UnsubscribeMqttTopic(CONNECTION* c, const char* topic)
 int messageArrived(void *context, char *topicName, int topicLen, MQTTClient_message *message)
 {
     CONNECTION *c = (CONNECTION *)context;
-    if (c == NULL || message == NULL)
+    if (c != NULL && message != NULL)
     {
-        return 1;
+        // 处理接收到的数据包
+        ProcessMqttMessages(c, message->payload, message->payloadlen);
     }
-
-    // 处理收到的数据包
-    if (message->payloadlen > 0 && message->payloadlen <= MAX_PACKET_SIZE)
-    {
-        ProcessMqttPacket(c, message->payload, message->payloadlen);
-    }
-    else
-    {
-        Debug("MQTT: Invalid packet size: %d", message->payloadlen);
-    }
-
     MQTTClient_freeMessage(&message);
     MQTTClient_free(topicName);
-    return 1;
 }
 
 // 设置MQTT配置
@@ -385,27 +389,88 @@ bool ConnectMqttClient(CONNECTION* c)
 // 发送VPN数据包通过MQTT
 void SendDataWithMQTT(CONNECTION *c)
 {
+    UCHAR *buf;
+    BUF *b;
+    UINT64 now = Tick64();
+    bool packet_sent = false;
+
+    // 验证参数
     if (c == NULL || c->MQTTClient == NULL || !c->SendBlocks)
     {
         return;
     }
 
-    BLOCK *b;
-    while ((b = GetNext(c->SendBlocks)) != NULL)
+    // 创建临时缓冲区
+    if (c->RecvBuf == NULL)
     {
-        // 添加大小检查
-        if (b->Size > MAX_PACKET_SIZE)
+        c->RecvBuf = Malloc(RECV_BUF_SIZE);
+    }
+    buf = c->RecvBuf;
+
+    // 组装并发送数据包
+    while (c->SendBlocks->num_item > 0)
+    {
+        // 创建新的缓冲区
+        b = NewBuf();
+
+        // 写入包头标识
+        WriteBuf(b, SE_UDP_SIGN, 4);
+        
+        // 写入会话密钥
+        WriteBufInt(b, c->Session->SessionKey32);
+        
+        // 写入序列号
+        UINT64 seq = Endian64(c->MqttSeq++);
+        WriteBuf(b, &seq, sizeof(seq));
+
+        // 打包发送队列中的数据包
+        while (true)
         {
-            Debug("MQTT: Packet too large: %d", b->Size);
-            FreeBlock(b);
-            continue;
+            BLOCK *block = GetNext(c->SendBlocks);
+            if (block == NULL)
+            {
+                break;
+            }
+
+            if (block->Size > 0 && block->Size <= MAX_PACKET_SIZE)
+            {
+                WriteBufInt(b, block->Size);
+                WriteBuf(b, block->Buf, block->Size);
+
+                c->Session->TotalSendSize += (UINT64)block->SizeofData;
+                c->Session->TotalSendSizeReal += (UINT64)block->Size;
+                packet_sent = true;
+            }
+
+            FreeBlock(block);
+            break;
         }
 
+        // 通过MQTT发送
         if (MQTTClient_isConnected((MQTTClient)c->MQTTClient))
         {
-            // ... 其余代码保持不变 ...
+            MQTTClient_message pubmsg = MQTTClient_message_initializer;
+            pubmsg.payload = b->Buf;
+            pubmsg.payloadlen = b->Size;
+            pubmsg.qos = c->MqttQoS;
+            pubmsg.retained = 0;
+
+            int rc = MQTTClient_publishMessage((MQTTClient)c->MQTTClient, 
+                c->MqttTopic, &pubmsg, NULL);
+            
+            if (rc != MQTTCLIENT_SUCCESS)
+            {
+                Debug("MQTT: Failed to publish message: %d\n", rc);
+            }
         }
-        FreeBlock(b);
+
+        FreeBuf(b);
+    }
+
+    // 更新最后通信时间
+    if (packet_sent)
+    {
+        c->Session->LastCommTime = now;
     }
 }
 void ProcessMqttPacket(CONNECTION *c, void *data, UINT size)
@@ -562,45 +627,122 @@ bool ConfigureVirtualAdapter(CONNECTION *c)
     return false;
 }
 // 处理 MQTT 消息
-void ProcessMqttMessages(CONNECTION *c) 
+void ProcessMqttMessages(CONNECTION *c, void *data, UINT size) 
 {
-    if (c && c->MQTTClient) 
+    BUF *b;
+    char sign[4];
+    
+    // 验证参数
+    if (c == NULL || data == NULL)
     {
-        // 处理接收到的消息
-        MQTTClient_yield();
-        
-        // 检查连接状态
-        if (!MQTTClient_isConnected((MQTTClient)c->MQTTClient)) 
+        return;
+    }
+
+    // 检查协议
+    if (c->Protocol != CONNECTION_MQTT)
+    {
+        return;
+    }
+
+    // 创建缓冲区
+    b = NewBuf();
+    WriteBuf(b, data, size);
+    SeekBuf(b, 0, 0);
+    
+    // 读取并验证签名
+    ReadBuf(b, sign, 4);
+    if (Cmp(sign, SE_UDP_SIGN, 4) == 0)
+    {
+        // 验证会话密钥
+        UINT key32 = ReadBufInt(b);
+        if (c->Session->SessionKey32 == key32)
         {
-            Debug("MQTT: Connection lost during processing, attempting to reconnect...");
-            MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
-            conn_opts.keepAliveInterval = 20;
-            conn_opts.cleansession = 1;
-            
-            int rc = MQTTClient_connect((MQTTClient)c->MQTTClient, &conn_opts);
-            if (rc == MQTTCLIENT_SUCCESS) 
+            // 读取序列号
+            UINT64 seq;
+            ReadBuf(b, &seq, sizeof(seq));
+            seq = Endian64(seq);
+
+            // 检查序列号
+            if ((UINT)(seq - c->MqttRecvSeq - (UINT64)1))
             {
-                Debug("MQTT: Reconnection successful");
-                // 重新订阅主题
-                MQTTClient_subscribe((MQTTClient)c->MQTTClient, 
-                    c->MqttTopic, c->MqttQoS);
+                Debug("MQTT: Sequence lost %u\n", 
+                    (UINT)(seq - c->MqttRecvSeq - (UINT64)1));
             }
-            else 
+            c->MqttRecvSeq = seq;
+
+            // 处理数据包
+            while (true)
             {
-                Debug("MQTT: Reconnection failed, return code %d", rc);
+                UINT size = ReadBufInt(b);
+                if (size == 0)
+                {
+                    break;
+                }
+                else if (size <= MAX_PACKET_SIZE)
+                {
+                    void *tmp = Malloc(size);
+                    if (ReadBuf(b, tmp, size) != size)
+                    {
+                        Free(tmp);
+                        break;
+                    }
+
+                    // 创建数据块并加入接收队列
+                    BLOCK *block = NewBlock(tmp, size, 0);
+                    InsertReceivedBlockToQueue(c, block, false);
+                }
             }
+
+            // 更新最后通信时间
+            c->Session->LastCommTime = Tick64();
+        }
+        else
+        {
+            Debug("MQTT: Invalid SessionKey: 0x%X\n", key32);
         }
     }
+
+    FreeBuf(b);
 }
 
 // 清理 MQTT 连接
 void CleanupMqttConnection(CONNECTION *c)
 {
-    if (c != NULL && c->MQTTClient)
+    if (c != NULL)
     {
-        MQTTClient_disconnect((MQTTClient)c->MQTTClient, TIMEOUT);
-        MQTTClient_destroy((MQTTClient*)&c->MQTTClient);
-        c->MQTTClient = NULL;
+        // 1. 清理MQTT客户端
+        if (c->MQTTClient)
+        {
+            MQTTClient_disconnect((MQTTClient)c->MQTTClient, TIMEOUT);
+            MQTTClient_destroy((MQTTClient*)&c->MQTTClient);
+            c->MQTTClient = NULL;
+        }
+
+        // 2. 清理发送队列
+        if (c->SendBlocks != NULL)
+        {
+            LockQueue(c->SendBlocks);
+            {
+                BLOCK *b;
+                while ((b = GetNext(c->SendBlocks)) != NULL)
+                {
+                    FreeBlock(b);
+                }
+            }
+            UnlockQueue(c->SendBlocks);
+            ReleaseQueue(c->SendBlocks);  // 添加这行
+            c->SendBlocks = NULL;
+        }
+
+        // 3. 清理PacketAdapter
+        if (c->Session && c->Session->PacketAdapter)
+        {
+            FreePacketAdapter(c->Session->PacketAdapter);
+            c->Session->PacketAdapter = NULL;
+        }
+
+        // 4. 清空主题
+        Zero(c->MqttTopic, sizeof(c->MqttTopic));
     }
 }
 
